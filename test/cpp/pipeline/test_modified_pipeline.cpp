@@ -479,6 +479,40 @@ size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
 }
 
 /**
+ * @brief True when MERGE_GROUP_BY and PROJECTION share a pipeline (fusion succeeded).
+ */
+bool has_fused_merge_group_by_with_projection(
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+{
+  for (const auto& pipeline : pipelines) {
+    bool has_merge      = false;
+    bool has_projection = false;
+    for (auto& op : pipeline->get_operators()) {
+      if (op.get().type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) { has_merge = true; }
+      if (op.get().type == SiriusPhysicalOperatorType::PROJECTION) { has_projection = true; }
+    }
+    if (has_merge && has_projection &&
+        pipeline->get_sink()->type != SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * @brief True when a pipeline uses MERGE_GROUP_BY only as a separate terminating sink.
+ */
+bool has_standalone_merge_group_by_pipeline(
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+{
+  for (const auto& pipeline : pipelines) {
+    if (pipeline->get_sink()->type != SiriusPhysicalOperatorType::MERGE_GROUP_BY) { continue; }
+    if (pipeline->get_operators().size() <= 1) { return true; }
+  }
+  return false;
+}
+
+/**
  * @brief Check if pipeline breakdown pattern matches expected:
  * Original sink (GROUP_BY, ORDER_BY, TOP_N, UNGROUPED_AGGREGATE) should be:
  * 1. Pipeline with PARTITION sink
@@ -1016,6 +1050,37 @@ TEST_CASE("Pipeline breakdown - GROUP_BY pattern", "[modified_pipeline][breakdow
   REQUIRE(info.partition_connects_to_concat);
 
   validate_modified_pipeline_structure(engine, "GROUP_BY pattern");
+
+  Config::MODIFIED_PIPELINE = false;
+}
+
+TEST_CASE("Pipeline breakdown - GROUP_BY fused with projection", "[modified_pipeline][breakdown]")
+{
+  DuckDB db(nullptr);
+  safe_load_extension(db);
+  Connection con(db);
+  safe_init_gpu_buffer(con);
+  Config::MODIFIED_PIPELINE = true;
+  create_tpch_schema(con);
+
+  // Post-aggregate expression on a group key forces a PROJECTION after GROUP BY.
+  std::string query = R"(
+    SELECT l_returnflag, SUM(l_quantity) AS total, CONCAT(l_returnflag, '-x') AS labeled
+    FROM lineitem
+    GROUP BY l_returnflag
+  )";
+
+  GPUContext gpu_context(*con.context);
+  auto gpu_plan = generate_gpu_plan(con, gpu_context, query);
+  REQUIRE(gpu_plan != nullptr);
+
+  sirius_engine engine(*con.context, gpu_context);
+  engine.initialize(std::move(gpu_plan));
+
+  REQUIRE(has_fused_merge_group_by_with_projection(engine.new_scheduled));
+  REQUIRE_FALSE(has_standalone_merge_group_by_pipeline(engine.new_scheduled));
+
+  validate_modified_pipeline_structure(engine, "GROUP_BY fused with projection");
 
   Config::MODIFIED_PIPELINE = false;
 }
