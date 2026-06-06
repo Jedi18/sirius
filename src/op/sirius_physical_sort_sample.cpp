@@ -25,8 +25,11 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
+#include <rmm/error.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
+#include <atomic>
 #include <functional>
 
 namespace sirius {
@@ -176,6 +179,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     // Normal path: input was claimed by get_next_task_input_data().
   } else if (state == BoundaryState::NOT_DONE) {
     // OOM retry or direct unit-test invoke — claim boundary computation.
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample execute() NOT_DONE path (OOM retry reschedule, batches={})",
+      input_batches.size());
     auto expected = BoundaryState::NOT_DONE;
     if (!_boundary_state.compare_exchange_strong(
           expected, BoundaryState::SCHEDULED, std::memory_order_acq_rel)) {
@@ -208,6 +214,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
   // reset to NOT_DONE so the rescheduled task can retry boundary computation.
   try {
+    // TEMPORARY (revert soon): fake OOM on first attempt to exercise the reschedule path.
+    static std::atomic<bool> throw_fake_oom{true};
+    if (throw_fake_oom.exchange(false)) {
+      SIRIUS_LOG_WARN(
+        "TEMP DEBUG: throwing fake rmm::out_of_memory — expect OOM reschedule then NOT_DONE "
+        "retry");
+      throw rmm::out_of_memory{"TEMP DEBUG sort_sample fake OOM for retry path test"};
+    }
+
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
       total_sample_bytes += batch.get_data()->get_size_in_bytes();
