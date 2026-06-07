@@ -37,6 +37,7 @@
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <sirius_context.hpp>
 #include <sirius_extension.hpp>
+#include <sirius_interface.hpp>
 
 #include <cstdlib>
 #include <filesystem>
