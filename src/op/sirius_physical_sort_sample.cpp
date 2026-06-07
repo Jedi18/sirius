@@ -102,28 +102,49 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
   const auto state = _boundary_state.load(std::memory_order_acquire);
 
   // Boundaries already computed — process batches one at a time.
-  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_hint(); }
+  if (state == BoundaryState::DONE) {
+    SIRIUS_LOG_WARN("TEMP DEBUG: sort_sample get_next_task_hint() state=DONE → base class");
+    return sirius_physical_operator::get_next_task_hint();
+  }
 
   // Boundary task already scheduled; wait for it to finish before creating more tasks.
-  if (state == BoundaryState::SCHEDULED) { return std::nullopt; }
+  if (state == BoundaryState::SCHEDULED) {
+    SIRIUS_LOG_WARN("TEMP DEBUG: sort_sample get_next_task_hint() state=SCHEDULED → nullopt");
+    return std::nullopt;
+  }
 
   // NOT_DONE: wait for enough sample bytes before scheduling the boundary task.
   auto port_ids = get_port_ids();
-  if (port_ids.empty()) { return std::nullopt; }
+  if (port_ids.empty()) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_hint() state=NOT_DONE, no ports → nullopt");
+    return std::nullopt;
+  }
 
   auto* p = get_port(port_ids[0]);
-  if (!p || !p->repo) { return std::nullopt; }
+  if (!p || !p->repo) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_hint() state=NOT_DONE, missing port/repo → nullopt");
+    return std::nullopt;
+  }
 
   bool upstream_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
   if (repo_has_enough_sample_bytes(p->repo, _sort_sample_bytes, upstream_finished)) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_hint() state=NOT_DONE → READY (upstream_finished={})",
+      upstream_finished);
     return task_creation_hint{TaskCreationHint::READY, this};
   }
 
   if (p->src_pipeline && !upstream_finished) {
     auto* producer = &(p->src_pipeline->get_operators()[0].get());
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_hint() state=NOT_DONE → WAITING (upstream "
+      "unfinished)");
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
+  SIRIUS_LOG_WARN("TEMP DEBUG: sort_sample get_next_task_hint() state=NOT_DONE → nullopt");
   return std::nullopt;
 }
 
@@ -132,18 +153,33 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   const auto state = _boundary_state.load(std::memory_order_acquire);
 
   // After boundaries are computed, process one batch at a time (passthrough mode).
-  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_input_data(); }
+  if (state == BoundaryState::DONE) {
+    SIRIUS_LOG_WARN("TEMP DEBUG: sort_sample get_next_task_input_data() state=DONE → base class");
+    return sirius_physical_operator::get_next_task_input_data();
+  }
 
   // Boundary input already claimed by the in-flight boundary task.
-  if (state == BoundaryState::SCHEDULED) { return nullptr; }
+  if (state == BoundaryState::SCHEDULED) {
+    SIRIUS_LOG_WARN("TEMP DEBUG: sort_sample get_next_task_input_data() state=SCHEDULED → nullptr");
+    return nullptr;
+  }
 
   // NOT_DONE: accumulate batches up to the sample byte threshold so execute() can merge
   // pre-sorted runs and derive partition boundaries from a representative sample.
   auto port_ids = get_port_ids();
-  if (port_ids.empty()) { return nullptr; }
+  if (port_ids.empty()) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_input_data() state=NOT_DONE, no ports → nullptr");
+    return nullptr;
+  }
 
   auto* p = get_port(port_ids[0]);
-  if (!p || !p->repo) { return nullptr; }
+  if (!p || !p->repo) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_input_data() state=NOT_DONE, missing port/repo → "
+      "nullptr");
+    return nullptr;
+  }
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
   uint64_t accumulated_bytes = 0;
@@ -155,9 +191,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
     if (accumulated_bytes >= _sort_sample_bytes) { break; }
   }
 
-  if (input_batch.empty()) { return nullptr; }
+  if (input_batch.empty()) {
+    SIRIUS_LOG_WARN(
+      "TEMP DEBUG: sort_sample get_next_task_input_data() state=NOT_DONE, empty repo → nullptr");
+    return nullptr;
+  }
 
   _boundary_state.store(BoundaryState::SCHEDULED, std::memory_order_release);
+  SIRIUS_LOG_WARN(
+    "TEMP DEBUG: sort_sample get_next_task_input_data() state=NOT_DONE → pulled {} batches "
+    "({} bytes), now SCHEDULED",
+    input_batch.size(),
+    accumulated_bytes);
   return std::make_unique<pipelineable_operator_data>(std::move(input_batch));
 }
 
