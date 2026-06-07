@@ -395,3 +395,14 @@ TEST_CASE("merge fusion stops before HASH JOIN after GROUP BY",
   REQUIRE(count_build_join_partitions(pipelines) >= 1);
   REQUIRE(count_operator_type(pipelines, SiriusPhysicalOperatorType::HASH_JOIN) >= 1);
 }
+
+TEST_CASE("merge fusion does not fold UNGROUPED_AGGREGATE downstream",
+          "[pipeline_converter][merge_fusion]")
+{
+  auto state = setup_and_convert("SELECT avg(l_quantity) FROM lineitem");
+
+  const auto& pipelines = state.conversion.scheduled_pipelines;
+  // UNGROUPED uses the same op as partial sink and merge source — keep merge separate.
+  REQUIRE(has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_AGGREGATE));
+  REQUIRE_FALSE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_AGGREGATE));
+}

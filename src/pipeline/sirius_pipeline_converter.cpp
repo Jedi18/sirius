@@ -723,8 +723,16 @@ void sirius_pipeline_converter::attach_merge_and_fuse_downstream(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
   size_t from_pipeline_idx)
 {
-  const bool fused = try_fuse_downstream_pipelineable(
-    merge_pipeline, merge_op, original_agg_source, copied_scheduled, from_pipeline_idx);
+  // UNGROUPED_AGGREGATE uses the same physical op as both the partial-aggregate sink and the
+  // merge pipeline source. Folding the downstream pipeline (typically RESULT_COLLECTOR) into the
+  // merge pipeline breaks partial→merge repository wiring and produces wrong merged results
+  // (e.g. avg off by orders of magnitude). Keep merge and downstream as separate pipelines.
+  const bool allow_fusion =
+    original_agg_source->type != op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
+  const bool fused =
+    allow_fusion &&
+    try_fuse_downstream_pipelineable(
+      merge_pipeline, merge_op, original_agg_source, copied_scheduled, from_pipeline_idx);
 
   if (!fused) { merge_pipeline->sink = merge_op; }
 
