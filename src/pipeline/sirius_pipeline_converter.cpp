@@ -869,18 +869,14 @@ void sirius_pipeline_converter::split_top_n_sink(
     new op::sirius_physical_top_n_merge(topn_ptr));
   auto* merge_ptr = merge_op.get();
 
-  // Pipeline B: TOP_N (source) -> MERGE_TOP_N (sink)
+  // Pipeline B: TOP_N (source) -> MERGE_TOP_N -> pipelineable downstream ops
   auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   merge_pipeline->source = top_n_op.get();
-  merge_pipeline->sink   = merge_ptr;
-  scheduled_.push_back(merge_pipeline);
 
-  // Update downstream pipelines to use MERGE_TOP_N as source
-  for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-    if (copied_scheduled[j]->source.get() == top_n_op.get()) {
-      copied_scheduled[j]->source = merge_ptr;
-    }
-  }
+  attach_merge_and_fuse_downstream(
+    merge_pipeline, merge_ptr, top_n_op.get(), copied_scheduled, pipeline_idx);
+
+  scheduled_.push_back(merge_pipeline);
 
   // Store ownership
   inserted_operators_.push_back(std::move(merge_op));
