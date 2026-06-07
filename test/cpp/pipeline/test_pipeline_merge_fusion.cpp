@@ -12,7 +12,7 @@
  * @file test_pipeline_merge_fusion.cpp
  * @brief Regression tests for merge-pipeline downstream fusion in sirius_pipeline_converter.
  *
- * Verifies that pipelineable operators (e.g. PROJECTION) fold into merge pipelines while
+ * Verifies that pipelineable downstream operators fold into merge pipelines while
  * structural downstream sinks (ORDER BY, HASH JOIN, etc.) remain separate split targets.
  */
 
@@ -237,18 +237,18 @@ size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
   return count;
 }
 
-bool has_fused_merge_with_projection(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType merge_type)
+//! True when a merge op and downstream pipelineable ops share one pipeline (fusion succeeded).
+//! Does not require PROJECTION — identity projections are omitted by the planner and fusion may
+//! fold straight into RESULT_COLLECTOR.
+bool has_fused_merge_pipeline(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+                              SiriusPhysicalOperatorType merge_type)
 {
   for (const auto& pipeline : pipelines) {
-    bool has_merge      = false;
-    bool has_projection = false;
+    bool has_merge = false;
     for (auto& op : pipeline->get_operators()) {
       if (op.get().type == merge_type) { has_merge = true; }
-      if (op.get().type == SiriusPhysicalOperatorType::PROJECTION) { has_projection = true; }
     }
-    if (has_merge && has_projection && pipeline->get_sink()->type != merge_type) { return true; }
+    if (has_merge && pipeline->get_sink()->type != merge_type) { return true; }
   }
   return false;
 }
@@ -274,20 +274,6 @@ size_t count_build_join_partitions(
     if (partition.is_build_partition()) { count++; }
   }
   return count;
-}
-
-bool pipeline_has_merge_in_operator_chain(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType merge_type,
-  SiriusPhysicalOperatorType marker_sink)
-{
-  for (const auto& pipeline : pipelines) {
-    if (pipeline->get_sink()->type != marker_sink) { continue; }
-    for (auto& op : pipeline->get_operators()) {
-      if (op.get().type == merge_type) { return true; }
-    }
-  }
-  return false;
 }
 
 bool pipeline_has_merge_with_sink(
@@ -319,7 +305,7 @@ size_t count_operator_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeli
 
 }  // namespace
 
-TEST_CASE("merge fusion folds projection after GROUP BY", "[pipeline_converter][merge_fusion]")
+TEST_CASE("merge fusion folds downstream after GROUP BY", "[pipeline_converter][merge_fusion]")
 {
   auto state = setup_and_initialize(R"(
     SELECT SUM(l_quantity) AS total, l_returnflag
@@ -327,13 +313,13 @@ TEST_CASE("merge fusion folds projection after GROUP BY", "[pipeline_converter][
     GROUP BY l_returnflag
   )");
 
-  REQUIRE(has_fused_merge_with_projection(state.engine->new_scheduled,
-                                          SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  REQUIRE(has_fused_merge_pipeline(state.engine->new_scheduled,
+                                   SiriusPhysicalOperatorType::MERGE_GROUP_BY));
   REQUIRE_FALSE(has_standalone_merge_pipeline(state.engine->new_scheduled,
                                               SiriusPhysicalOperatorType::MERGE_GROUP_BY));
 }
 
-TEST_CASE("merge fusion folds projection after TOP_N", "[pipeline_converter][merge_fusion]")
+TEST_CASE("merge fusion folds downstream after TOP_N", "[pipeline_converter][merge_fusion]")
 {
   auto state = setup_and_initialize(R"(
     SELECT l_extendedprice, l_orderkey
@@ -342,8 +328,8 @@ TEST_CASE("merge fusion folds projection after TOP_N", "[pipeline_converter][mer
     LIMIT 10
   )");
 
-  REQUIRE(has_fused_merge_with_projection(state.engine->new_scheduled,
-                                          SiriusPhysicalOperatorType::MERGE_TOP_N));
+  REQUIRE(
+    has_fused_merge_pipeline(state.engine->new_scheduled, SiriusPhysicalOperatorType::MERGE_TOP_N));
   REQUIRE_FALSE(has_standalone_merge_pipeline(state.engine->new_scheduled,
                                               SiriusPhysicalOperatorType::MERGE_TOP_N));
 }
@@ -357,19 +343,17 @@ TEST_CASE("merge fusion stops before ORDER BY after GROUP BY", "[pipeline_conver
     ORDER BY total DESC
   )");
 
-  // Projection shares the downstream pipeline with ORDER BY, so the whole pipeline is kept
-  // separate — only the merge op stays on the merge pipeline.
+  // ORDER BY is a structural sink — fusion is blocked and merge stays on its own pipeline.
   REQUIRE(has_standalone_merge_pipeline(state.engine->new_scheduled,
                                         SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  REQUIRE_FALSE(has_fused_merge_pipeline(state.engine->new_scheduled,
+                                         SiriusPhysicalOperatorType::MERGE_GROUP_BY));
   REQUIRE_FALSE(pipeline_has_merge_with_sink(state.engine->new_scheduled,
                                              SiriusPhysicalOperatorType::MERGE_GROUP_BY,
                                              SiriusPhysicalOperatorType::ORDER_BY));
   REQUIRE(count_sink_type(state.engine->new_scheduled, SiriusPhysicalOperatorType::ORDER_BY) >= 1);
   REQUIRE(
     count_operator_type(state.engine->new_scheduled, SiriusPhysicalOperatorType::MERGE_SORT) >= 1);
-  REQUIRE(pipeline_has_merge_in_operator_chain(state.engine->new_scheduled,
-                                               SiriusPhysicalOperatorType::MERGE_GROUP_BY,
-                                               SiriusPhysicalOperatorType::ORDER_BY));
 }
 
 TEST_CASE("merge fusion stops before HASH JOIN after GROUP BY",
