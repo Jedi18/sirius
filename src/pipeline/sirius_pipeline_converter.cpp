@@ -654,6 +654,20 @@ bool is_fusable_downstream_operator(const op::sirius_physical_operator& op)
   return !op.is_sink() && !op.is_source();
 }
 
+// Must stay in sync with split_pipelines() sink dispatch: any sink handled by a
+// dedicated split_* function must not be absorbed via downstream fusion.
+bool sink_needs_pipeline_split(op::SiriusPhysicalOperatorType type)
+{
+  return type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+         type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+         type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+         type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
+         type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+         type == op::SiriusPhysicalOperatorType::TOP_N ||
+         type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+         type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
+}
+
 }  // namespace
 
 bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
@@ -663,9 +677,28 @@ bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
   size_t from_pipeline_idx)
 {
+  // If any downstream pipeline from this aggregate ends in a structural sink, do not fuse.
   for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
     auto& downstream = copied_scheduled[j];
     if (downstream->source.get() != original_agg_source) { continue; }
+    if (sink_needs_pipeline_split(downstream->get_sink()->type)) { return false; }
+  }
+
+  for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
+    auto& downstream = copied_scheduled[j];
+    if (downstream->source.get() != original_agg_source) { continue; }
+
+    // Do not fuse a pipelineable downstream when a later structural pipeline reads
+    // from its output (e.g. GROUP_BY -> PROJECTION then PROJECTION -> HASH_JOIN).
+    for (size_t k = j + 1; k < copied_scheduled.size(); k++) {
+      auto& later = copied_scheduled[k];
+      if (!sink_needs_pipeline_split(later->get_sink()->type)) { continue; }
+      const auto* later_source = later->source.get();
+      if (later_source == downstream->get_sink().get()) { return false; }
+      for (auto& op_ref : downstream->operators) {
+        if (later_source == &op_ref.get()) { return false; }
+      }
+    }
 
     for (auto& op_ref : downstream->operators) {
       if (!is_fusable_downstream_operator(op_ref.get())) { return false; }
@@ -690,16 +723,16 @@ void sirius_pipeline_converter::attach_merge_and_fuse_downstream(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
   size_t from_pipeline_idx)
 {
-  if (try_fuse_downstream_pipelineable(
-        merge_pipeline, merge_op, original_agg_source, copied_scheduled, from_pipeline_idx)) {
-    return;
-  }
+  const bool fused = try_fuse_downstream_pipelineable(
+    merge_pipeline, merge_op, original_agg_source, copied_scheduled, from_pipeline_idx);
 
-  merge_pipeline->sink = merge_op;
+  if (!fused) { merge_pipeline->sink = merge_op; }
+
+  // Repoint not-yet-split downstream pipelines to read from the merge op.
   for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-    if (copied_scheduled[j]->source.get() == original_agg_source) {
-      copied_scheduled[j]->source = merge_op;
-    }
+    auto& downstream = copied_scheduled[j];
+    if (absorbed_pipelines_.count(downstream.get()) > 0) { continue; }
+    if (downstream->source.get() == original_agg_source) { downstream->source = merge_op; }
   }
 }
 

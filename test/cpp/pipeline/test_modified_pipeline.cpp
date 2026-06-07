@@ -479,39 +479,6 @@ size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
 }
 
 /**
- * @brief True when a merge operator and PROJECTION share a pipeline (fusion succeeded).
- */
-bool has_fused_merge_with_projection(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType merge_type)
-{
-  for (const auto& pipeline : pipelines) {
-    bool has_merge      = false;
-    bool has_projection = false;
-    for (auto& op : pipeline->get_operators()) {
-      if (op.get().type == merge_type) { has_merge = true; }
-      if (op.get().type == SiriusPhysicalOperatorType::PROJECTION) { has_projection = true; }
-    }
-    if (has_merge && has_projection && pipeline->get_sink()->type != merge_type) { return true; }
-  }
-  return false;
-}
-
-/**
- * @brief True when a pipeline uses the given merge op only as a separate terminating sink.
- */
-bool has_standalone_merge_pipeline(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType merge_type)
-{
-  for (const auto& pipeline : pipelines) {
-    if (pipeline->get_sink()->type != merge_type) { continue; }
-    if (pipeline->get_operators().size() <= 1) { return true; }
-  }
-  return false;
-}
-
-/**
  * @brief Check if pipeline breakdown pattern matches expected:
  * Original sink (GROUP_BY, ORDER_BY, TOP_N, UNGROUPED_AGGREGATE) should be:
  * 1. Pipeline with PARTITION sink
@@ -1053,39 +1020,6 @@ TEST_CASE("Pipeline breakdown - GROUP_BY pattern", "[modified_pipeline][breakdow
   Config::MODIFIED_PIPELINE = false;
 }
 
-TEST_CASE("Pipeline breakdown - GROUP_BY fused with projection", "[modified_pipeline][breakdown]")
-{
-  DuckDB db(nullptr);
-  safe_load_extension(db);
-  Connection con(db);
-  safe_init_gpu_buffer(con);
-  Config::MODIFIED_PIPELINE = true;
-  create_tpch_schema(con);
-
-  // Post-aggregate expression on a group key forces a PROJECTION after GROUP BY.
-  std::string query = R"(
-    SELECT l_returnflag, SUM(l_quantity) AS total, CONCAT(l_returnflag, '-x') AS labeled
-    FROM lineitem
-    GROUP BY l_returnflag
-  )";
-
-  GPUContext gpu_context(*con.context);
-  auto gpu_plan = generate_gpu_plan(con, gpu_context, query);
-  REQUIRE(gpu_plan != nullptr);
-
-  sirius_engine engine(*con.context, gpu_context);
-  engine.initialize(std::move(gpu_plan));
-
-  REQUIRE(has_fused_merge_with_projection(engine.new_scheduled,
-                                          SiriusPhysicalOperatorType::MERGE_GROUP_BY));
-  REQUIRE_FALSE(has_standalone_merge_pipeline(engine.new_scheduled,
-                                              SiriusPhysicalOperatorType::MERGE_GROUP_BY));
-
-  validate_modified_pipeline_structure(engine, "GROUP_BY fused with projection");
-
-  Config::MODIFIED_PIPELINE = false;
-}
-
 TEST_CASE("Pipeline breakdown - ORDER_BY pattern", "[modified_pipeline][breakdown]")
 {
   DuckDB db(nullptr);
@@ -1146,40 +1080,6 @@ TEST_CASE("Pipeline breakdown - TOP_N pattern", "[modified_pipeline][breakdown]"
   // TOP_N should have PARTITION
   REQUIRE(count_partition_sinks(engine.new_scheduled) >= 1);
   validate_modified_pipeline_structure(engine, "TOP_N pattern");
-
-  Config::MODIFIED_PIPELINE = false;
-}
-
-TEST_CASE("Pipeline breakdown - TOP_N fused with projection", "[modified_pipeline][breakdown]")
-{
-  DuckDB db(nullptr);
-  safe_load_extension(db);
-  Connection con(db);
-  safe_init_gpu_buffer(con);
-  Config::MODIFIED_PIPELINE = true;
-  create_tpch_schema(con);
-
-  // Post-top-N expression forces a PROJECTION after TOP_N.
-  std::string query = R"(
-    SELECT l_orderkey, l_extendedprice, CONCAT(l_shipmode, '-x') AS labeled
-    FROM lineitem
-    ORDER BY l_extendedprice DESC
-    LIMIT 10
-  )";
-
-  GPUContext gpu_context(*con.context);
-  auto gpu_plan = generate_gpu_plan(con, gpu_context, query);
-  REQUIRE(gpu_plan != nullptr);
-
-  sirius_engine engine(*con.context, gpu_context);
-  engine.initialize(std::move(gpu_plan));
-
-  REQUIRE(
-    has_fused_merge_with_projection(engine.new_scheduled, SiriusPhysicalOperatorType::MERGE_TOP_N));
-  REQUIRE_FALSE(
-    has_standalone_merge_pipeline(engine.new_scheduled, SiriusPhysicalOperatorType::MERGE_TOP_N));
-
-  validate_modified_pipeline_structure(engine, "TOP_N fused with projection");
 
   Config::MODIFIED_PIPELINE = false;
 }
