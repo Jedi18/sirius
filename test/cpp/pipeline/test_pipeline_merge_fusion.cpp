@@ -14,6 +14,9 @@
  *
  * Verifies that pipelineable downstream operators fold into merge pipelines while
  * structural downstream sinks (ORDER BY, HASH JOIN, etc.) remain separate split targets.
+ *
+ * Exercises sirius_pipeline_converter only (no repository materialization) so complex
+ * plans can be inspected without tripping shared data-repo registration limits.
  */
 
 #include <catch.hpp>
@@ -22,16 +25,18 @@
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <op/sirius_physical_result_collector.hpp>
+#include <pipeline/sirius_meta_pipeline.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <pipeline/sirius_pipeline_converter.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
-#include <sirius_engine.hpp>
+#include <sirius_context.hpp>
 #include <sirius_extension.hpp>
-#include <sirius_interface.hpp>
 
 #include <cstdlib>
 #include <filesystem>
@@ -40,15 +45,17 @@
 
 using namespace duckdb;
 
-using sirius::sirius_engine;
-using sirius::sirius_interface;
 using sirius::sirius_prepared_statement_data;
 using sirius::op::sirius_physical_materialized_collector;
 using sirius::op::sirius_physical_operator;
 using sirius::op::sirius_physical_partition;
 using sirius::op::sirius_physical_result_collector;
 using sirius::op::SiriusPhysicalOperatorType;
+using sirius::pipeline::pipeline_conversion_result;
+using sirius::pipeline::sirius_meta_pipeline;
 using sirius::pipeline::sirius_pipeline;
+using sirius::pipeline::sirius_pipeline_build_state;
+using sirius::pipeline::sirius_pipeline_converter;
 using sirius::planner::sirius_physical_plan_generator;
 
 namespace {
@@ -198,16 +205,16 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
   return gpu_collector;
 }
 
-struct engine_test_state {
+struct converter_test_state {
   duckdb::unique_ptr<DuckDB> db;
   duckdb::unique_ptr<Connection> con;
-  duckdb::unique_ptr<sirius_interface> iface;
-  duckdb::unique_ptr<sirius_engine> engine;
+  duckdb::unique_ptr<sirius_physical_operator> gpu_plan;
+  pipeline_conversion_result conversion;
 };
 
-engine_test_state setup_and_initialize(const std::string& query)
+converter_test_state setup_and_convert(const std::string& query)
 {
-  engine_test_state state;
+  converter_test_state state;
   set_test_config_env();
   Config::MODIFIED_PIPELINE = true;
   unsetenv("SIRIUS_DISABLE");
@@ -217,12 +224,27 @@ engine_test_state setup_and_initialize(const std::string& query)
   safe_init_gpu_buffer(*state.con);
   create_minimal_schema(*state.con);
 
-  auto gpu_plan = generate_gpu_plan(*state.con, query);
-  REQUIRE(gpu_plan != nullptr);
+  state.gpu_plan = generate_gpu_plan(*state.con, query);
+  REQUIRE(state.gpu_plan != nullptr);
 
-  state.iface  = duckdb::make_uniq<sirius_interface>(*state.con->context);
-  state.engine = duckdb::make_uniq<sirius_engine>(*state.con->context, *state.iface);
-  state.engine->initialize(std::move(gpu_plan));
+  auto sirius_ctx =
+    state.con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  const sirius::operator_params& op_params = sirius_ctx->get_config().get_operator_params();
+
+  sirius::pipeline::pipeline_build_context build_ctx;
+  build_ctx.preserve_insertion_order =
+    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(*state.con->context);
+  build_ctx.num_gpus = static_cast<int>(sirius_ctx->get_config().get_hw_topology().gpus.size());
+
+  sirius_pipeline_build_state pipeline_state;
+  auto root_pipeline =
+    duckdb::make_shared_ptr<sirius_meta_pipeline>(build_ctx, pipeline_state, nullptr);
+  root_pipeline->build(*state.gpu_plan);
+  root_pipeline->ready();
+
+  sirius_pipeline_converter converter(build_ctx, op_params, nullptr, state.con->context.get());
+  state.conversion = converter.convert(*root_pipeline);
 
   return state;
 }
@@ -307,59 +329,55 @@ size_t count_operator_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeli
 
 TEST_CASE("merge fusion folds downstream after GROUP BY", "[pipeline_converter][merge_fusion]")
 {
-  auto state = setup_and_initialize(R"(
+  auto state = setup_and_convert(R"(
     SELECT SUM(l_quantity) AS total, l_returnflag
     FROM lineitem
     GROUP BY l_returnflag
   )");
 
-  REQUIRE(has_fused_merge_pipeline(state.engine->new_scheduled,
-                                   SiriusPhysicalOperatorType::MERGE_GROUP_BY));
-  REQUIRE_FALSE(has_standalone_merge_pipeline(state.engine->new_scheduled,
-                                              SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  const auto& pipelines = state.conversion.scheduled_pipelines;
+  REQUIRE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  REQUIRE_FALSE(
+    has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
 }
 
 TEST_CASE("merge fusion folds downstream after TOP_N", "[pipeline_converter][merge_fusion]")
 {
-  auto state = setup_and_initialize(R"(
+  auto state = setup_and_convert(R"(
     SELECT l_extendedprice, l_orderkey
     FROM lineitem
     ORDER BY l_extendedprice DESC
     LIMIT 10
   )");
 
-  REQUIRE(
-    has_fused_merge_pipeline(state.engine->new_scheduled, SiriusPhysicalOperatorType::MERGE_TOP_N));
-  REQUIRE_FALSE(has_standalone_merge_pipeline(state.engine->new_scheduled,
-                                              SiriusPhysicalOperatorType::MERGE_TOP_N));
+  const auto& pipelines = state.conversion.scheduled_pipelines;
+  REQUIRE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_TOP_N));
+  REQUIRE_FALSE(has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_TOP_N));
 }
 
 TEST_CASE("merge fusion stops before ORDER BY after GROUP BY", "[pipeline_converter][merge_fusion]")
 {
-  auto state = setup_and_initialize(R"(
+  auto state = setup_and_convert(R"(
     SELECT SUM(l_quantity) AS total, l_returnflag
     FROM lineitem
     GROUP BY l_returnflag
     ORDER BY total DESC
   )");
 
+  const auto& pipelines = state.conversion.scheduled_pipelines;
   // ORDER BY is a structural sink — fusion is blocked and merge stays on its own pipeline.
-  REQUIRE(has_standalone_merge_pipeline(state.engine->new_scheduled,
-                                        SiriusPhysicalOperatorType::MERGE_GROUP_BY));
-  REQUIRE_FALSE(has_fused_merge_pipeline(state.engine->new_scheduled,
-                                         SiriusPhysicalOperatorType::MERGE_GROUP_BY));
-  REQUIRE_FALSE(pipeline_has_merge_with_sink(state.engine->new_scheduled,
-                                             SiriusPhysicalOperatorType::MERGE_GROUP_BY,
-                                             SiriusPhysicalOperatorType::ORDER_BY));
-  REQUIRE(count_sink_type(state.engine->new_scheduled, SiriusPhysicalOperatorType::ORDER_BY) >= 1);
-  REQUIRE(
-    count_operator_type(state.engine->new_scheduled, SiriusPhysicalOperatorType::MERGE_SORT) >= 1);
+  REQUIRE(has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  REQUIRE_FALSE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
+  REQUIRE_FALSE(pipeline_has_merge_with_sink(
+    pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY, SiriusPhysicalOperatorType::ORDER_BY));
+  REQUIRE(count_sink_type(pipelines, SiriusPhysicalOperatorType::ORDER_BY) >= 1);
+  REQUIRE(count_operator_type(pipelines, SiriusPhysicalOperatorType::MERGE_SORT) >= 1);
 }
 
 TEST_CASE("merge fusion stops before HASH JOIN after GROUP BY",
           "[pipeline_converter][merge_fusion]")
 {
-  auto state = setup_and_initialize(R"(
+  auto state = setup_and_convert(R"(
     SELECT grouped.total, grouped.l_returnflag, o.o_orderkey
     FROM (
       SELECT l_returnflag, l_orderkey, SUM(l_quantity) AS total
@@ -369,11 +387,10 @@ TEST_CASE("merge fusion stops before HASH JOIN after GROUP BY",
     JOIN orders o ON grouped.l_orderkey = o.o_orderkey
   )");
 
+  const auto& pipelines = state.conversion.scheduled_pipelines;
   // Join follows the grouped subquery; merge must not absorb the join sink.
-  REQUIRE_FALSE(pipeline_has_merge_with_sink(state.engine->new_scheduled,
-                                             SiriusPhysicalOperatorType::MERGE_GROUP_BY,
-                                             SiriusPhysicalOperatorType::HASH_JOIN));
-  REQUIRE(count_build_join_partitions(state.engine->new_scheduled) >= 1);
-  REQUIRE(count_operator_type(state.engine->new_scheduled, SiriusPhysicalOperatorType::HASH_JOIN) >=
-          1);
+  REQUIRE_FALSE(pipeline_has_merge_with_sink(
+    pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY, SiriusPhysicalOperatorType::HASH_JOIN));
+  REQUIRE(count_build_join_partitions(pipelines) >= 1);
+  REQUIRE(count_operator_type(pipelines, SiriusPhysicalOperatorType::HASH_JOIN) >= 1);
 }
