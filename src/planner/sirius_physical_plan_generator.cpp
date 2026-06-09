@@ -27,6 +27,8 @@
 #include "log/logging.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
+#include <cstdlib>
+
 namespace sirius::planner {
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
