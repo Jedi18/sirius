@@ -21,6 +21,7 @@
 #include "op/sirius_physical_projection.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,19 @@ namespace sirius::planner {
 namespace {
 
 using projection = sirius::op::sirius_physical_projection;
+
+// Benchmarking escape hatch: when SIRIUS_DISABLE_PROJECTION_FOLDING is set to a
+// non-empty, non-"0" value, both the push-time fold and the post-pass become
+// no-ops, so a single binary can be A/B'd (fold on vs off) without rebuilding.
+// Read once and cached — the plan generator runs this on every query.
+bool projection_folding_disabled()
+{
+  static bool const disabled = [] {
+    char const* v = std::getenv("SIRIUS_DISABLE_PROJECTION_FOLDING");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return disabled;
+}
 
 // A select-list entry is "fully supported" only if every slot is non-null.
 // A null slot is the from_duckdb fallback signal for an unsupported expression;
@@ -161,6 +175,13 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
   std::size_t estimated_cardinality)
 {
+  if (projection_folding_disabled()) {
+    auto projection_op = duckdb::make_uniq<projection>(
+      std::move(types), std::move(select_list), estimated_cardinality);
+    projection_op->children.push_back(std::move(child));
+    return std::move(projection_op);
+  }
+
   if (is_identity_ast_projection(select_list) && child->types.size() == types.size()) {
     return child;
   }
@@ -177,6 +198,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> fold_adjacent_projections(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan)
 {
+  if (projection_folding_disabled()) { return plan; }
   for (auto& child : plan->children) {
     child = fold_adjacent_projections(std::move(child));
   }
