@@ -369,6 +369,33 @@ exec_result run_select(memory_space& space,
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
+// Like run_execute, but exercises the owning execute(std::unique_ptr<cudf::table>) overload that
+// lets pass-through outputs reuse (move out) their input columns. The input is copied into an owned
+// table so the original input_batch remains intact for comparison.
+exec_result run_execute_owned(memory_space& space,
+                              std::shared_ptr<data_batch> const& input_batch,
+                              std::vector<std::unique_ptr<ast_node>> nodes,
+                              exp_strategy_enum strategy = MAT)
+{
+  duckdb::vector<std::unique_ptr<ast_node>> ast_nodes;
+  for (auto& n : nodes) {
+    ast_nodes.push_back(std::move(n));
+  }
+  exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  auto input_ro      = input_batch->to_read_only();
+  auto& in_repr      = input_ro.get_data()->cast<gpu_table_representation>();
+  auto const in_view = in_repr.get_table_view();
+  auto owned_input =
+    std::make_unique<cudf::table>(in_view, cudf::get_default_stream(), get_resource_ref(space));
+  auto output_table = executor.execute(std::move(owned_input));
+  REQUIRE(output_table != nullptr);
+  auto output_batch = sirius::make_data_batch(
+    std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
+  auto output_ro = output_batch->to_read_only();
+  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  return {input_batch, output_batch, in_view, out_repr.get_table_view()};
+}
+
 // Convenience: pack a single node into the projection driver's vector.
 std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
 {
@@ -377,6 +404,86 @@ std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
   return v;
 }
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// execute(std::unique_ptr<cudf::table>) — owning overload that reuses input columns
+// ---------------------------------------------------------------------------
+
+TEST_CASE("execute reuses owned input columns for pass-through outputs",
+          "[expression_executor][reuse_input_columns]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const int_type = cudf::data_type{cudf::type_id::INT32};
+
+  SECTION("reorder and prune columns")
+  {
+    // 3 input columns; project [col2, col0] (col1 dropped).
+    auto input = make_input_batch(
+      *space,
+      {int_type, int_type, int_type},
+      {std::pair<int, int>{0, 100}, std::pair<int, int>{100, 200}, std::pair<int, int>{200, 300}});
+
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(2));
+    exprs.push_back(make_ref(0));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute_owned(*space, input, std::move(exprs));
+    REQUIRE(ov.num_columns() == 2);
+    REQUIRE(ov.num_rows() == iv.num_rows());
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) ==
+            copy_column_to_host<int32_t>(iv.column(2)));
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(1)) ==
+            copy_column_to_host<int32_t>(iv.column(0)));
+  }
+
+  SECTION("duplicate reference copies all but the last")
+  {
+    // Projecting the same column twice forces a copy for the earlier reference and a move for the
+    // last; both outputs must equal the input column.
+    auto input = make_input_batch(*space, {int_type}, {std::pair<int, int>{0, 100}});
+
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(0));
+    exprs.push_back(make_ref(0));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute_owned(*space, input, std::move(exprs));
+    REQUIRE(ov.num_columns() == 2);
+    auto in0 = copy_column_to_host<int32_t>(iv.column(0));
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == in0);
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(1)) == in0);
+  }
+
+  SECTION("computed output reads a column that is also passed through")
+  {
+    // SELECT b, (a > 50), a  — the comparison reads col0 while col0 is also a deferred pass-through
+    // (output 2). The deferred reclaim guarantees col0 is not moved out until the comparison has
+    // read it.
+    auto input = make_input_batch(
+      *space, {int_type, int_type}, {std::pair<int, int>{0, 100}, std::pair<int, int>{100, 200}});
+
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(1));
+    exprs.push_back(make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(50)));
+    exprs.push_back(make_ref(0));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute_owned(*space, input, std::move(exprs));
+    REQUIRE(ov.num_columns() == 3);
+    REQUIRE(ov.num_rows() == iv.num_rows());
+
+    auto in0 = copy_column_to_host<int32_t>(iv.column(0));
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) ==
+            copy_column_to_host<int32_t>(iv.column(1)));
+    std::vector<uint8_t> expected_cmp;
+    expected_cmp.reserve(in0.size());
+    for (auto v : in0) {
+      expected_cmp.push_back(v > 50 ? 1U : 0U);
+    }
+    REQUIRE(copy_bool_column_to_host(ov.column(1)) == expected_cmp);
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(2)) == in0);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // execute() — reference, constant, comparison (basic smoke test per type)
