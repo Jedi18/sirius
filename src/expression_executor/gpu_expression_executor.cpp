@@ -44,7 +44,10 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <cstdint>
 #include <numeric>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 
 namespace {
@@ -258,6 +261,21 @@ void gpu_expression_executor::release_temporaries(
 
 std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view input)
 {
+  return execute_impl(input, /*owned_input=*/nullptr);
+}
+
+std::unique_ptr<cudf::table> gpu_expression_executor::execute(std::unique_ptr<cudf::table> input)
+{
+  // Evaluate against the owned table's view, but retain ownership so trivial pass-through outputs
+  // can reuse (move out) their input columns instead of deep-copying them (see execute_impl). The
+  // view is taken into a local first so it is sequenced before `input` is moved into the call.
+  auto const view = input->view();
+  return execute_impl(view, std::move(input));
+}
+
+std::unique_ptr<cudf::table> gpu_expression_executor::execute_impl(
+  cudf::table_view input, std::unique_ptr<cudf::table> owned_input)
+{
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
@@ -267,12 +285,15 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   _temp_scalars.clear();
   _temp_columns.clear();
 
-  // Get the table_view from the input_batch
-  _input_table = std::move(input);
+  // Get the table_view from the input_batch. On the owning path, _input_table is a view into
+  // _owned_input, which stays alive until the pass-through reclaim below.
+  _input_table = input;
+  _owned_input = std::move(owned_input);
 
   // Per-result column post-processing. The AST node is round-tripped through
   // sirius::ast::to_duckdb to recover the expression_class + return_type fields
-  // that drive the post-processing path.
+  // that drive the post-processing path. On the owning path, BOUND_REF outputs are deferred and
+  // reused below rather than reaching here, so this BOUND_REF branch only runs on the copying path.
   auto post_process = [this](duckdb::Expression const& expr, execute_result result) {
     if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
       // BOUND_REF: pass column through without type check
@@ -311,13 +332,57 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   // Iterate _ast_expressions and route through the std::visit dispatcher.
   // The per-result post-processing recovers expression_class + return_type by
   // round-tripping through sirius::ast::to_duckdb.
+  //
+  // On the owning path, a top-level column reference (BOUND_REF) is deferred: we record its source
+  // column index plus a placeholder output slot, then reclaim the column by moving it out of the
+  // owned input after every other expression has been evaluated. Deferring the move is required
+  // for correctness when a passed-through column is also read by another expression (e.g.
+  // SELECT a, a + 1): the move must happen only once every expression that reads the input view
+  // has finished.
+  std::vector<std::pair<std::size_t, std::uint32_t>> deferred_passthroughs;
   for (auto const* ast_expr : _ast_expressions) {
+    if (_owned_input != nullptr && ast_expr->is_reference()) {
+      deferred_passthroughs.emplace_back(_output_columns.size(),
+                                         ast_expr->as_reference().column_index);
+      _output_columns.push_back(nullptr);  // placeholder filled during reclaim below
+      continue;
+    }
     auto result    = execute(*ast_expr, execution_mode::MATERIALIZE);
     auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
     post_process(*duck_expr, std::move(result));
   }
 
-  return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
+  // Reclaim pass-through columns from the owned input. The final (or sole) reference to a given
+  // input column moves it out zero-copy; any earlier duplicate references to the same column copy
+  // it. Input columns that no output references are freed when input_columns goes out of scope.
+  if (_owned_input != nullptr) {
+    auto input_columns = _owned_input->release();
+    std::unordered_map<std::uint32_t, std::size_t> remaining_refs;
+    for (auto const& [out_idx, src_idx] : deferred_passthroughs) {
+      ++remaining_refs[src_idx];
+    }
+    for (auto const& [out_idx, src_idx] : deferred_passthroughs) {
+      if (src_idx >= input_columns.size()) {
+        throw internal_exception(
+          "[gpu_expression_executor] pass-through column index {} out of range (input has {} "
+          "columns)",
+          src_idx,
+          input_columns.size());
+      }
+      if (--remaining_refs[src_idx] == 0) {
+        _output_columns[out_idx] = std::move(input_columns[src_idx]);  // zero-copy reuse
+      } else {
+        _output_columns[out_idx] =
+          std::make_unique<cudf::column>(input_columns[src_idx]->view(), _stream, _mr);
+      }
+    }
+  }
+
+  auto output = std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
+  // The owned input (now emptied of any reused columns) and its now-dangling view are done with.
+  _owned_input.reset();
+  _input_table = cudf::table_view{};
+  return output;
 }
 
 std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
