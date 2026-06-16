@@ -128,6 +128,10 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
         if (validity.RowIsValid(r)) { string_bytes += string_data[r].GetSize(); }
       }
       total_size += string_bytes;
+    } else if (types[c].id() == type_id::SQLNULL) {
+      // SQLNULL: every row is null by definition — no real data, but we still allocate
+      // one INT8 byte per row as a placeholder so cuDF gets a valid (all-null) column.
+      total_size += static_cast<size_t>(num_rows);
     } else {
       total_size += static_cast<size_t>(num_rows) * types[c].fixed_width_byte_size();
     }
@@ -167,7 +171,8 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     cudf::size_type nulls = 0;
 
     cucascade::memory::column_metadata col{};
-    col.type_id  = sirius::get_cudf_type(sirius_t).id();
+    col.type_id  = (sirius_t.id() == type_id::SQLNULL) ? cudf::type_id::INT8
+                                                       : sirius::get_cudf_type(sirius_t).id();
     col.num_rows = num_rows;
     col.scale    = 0;
     if (sirius_t.is_decimal()) { col.scale = static_cast<int32_t>(sirius_t.decimal_scale()); }
@@ -228,6 +233,28 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       offsets_child.data_size     = offsets_size;
       col.children.push_back(std::move(offsets_child));
 
+    } else if (sirius_t.id() == type_id::SQLNULL) {
+      // SQLNULL: every row is null by definition. Represent as an all-null INT8 column
+      // (type_id already set to INT8 above) so cuDF gets a valid typed column. The data
+      // bytes are zero-filled; the null mask is all-zero (all rows null). No DuckDB
+      // FlatVector data is read since a SQLNULL vector has no valid data pointer.
+      size_t data_offset = offset;
+      size_t data_size   = static_cast<size_t>(num_rows);
+      std::memset(base_ptr + data_offset, 0, data_size);
+      offset += data_size;
+
+      size_t mask_offset = offset;
+      size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
+      std::memset(base_ptr + mask_offset, 0x00, mask_size);
+      offset += mask_size;
+
+      col.has_data         = true;
+      col.data_offset      = data_offset;
+      col.data_size        = data_size;
+      col.null_count       = static_cast<cudf::size_type>(num_rows);
+      col.has_null_mask    = true;
+      col.null_mask_offset = mask_offset;
+      col.null_mask_size   = mask_size;
     } else {
       // Fixed-width column
       size_t type_size = sirius_t.fixed_width_byte_size();
