@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "log/logging.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
@@ -283,7 +285,12 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
       // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
       // Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
-      auto const cudf_return_type = GetCudfType(expr.return_type);
+      // SQLNULL-typed expressions are encoded as all-null INT8 on the GPU (see
+      // cpu_source_task / gpu_execute_constant); map to INT8 rather than calling
+      // GetCudfType which throws for SQLNULL.
+      auto const cudf_return_type = (expr.return_type.id() == duckdb::LogicalTypeId::SQLNULL)
+                                      ? cudf::data_type(cudf::type_id::INT8)
+                                      : GetCudfType(expr.return_type);
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
         result_column =
@@ -311,11 +318,25 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   // Iterate _ast_expressions and route through the std::visit dispatcher.
   // The per-result post-processing recovers expression_class + return_type by
   // round-tripping through sirius::ast::to_duckdb.
+  SIRIUS_LOG_INFO("[DBG] gpu_expression_executor::execute — {} exprs, {} input rows",
+                  _ast_expressions.size(),
+                  _input_table.num_rows());
+  spdlog::default_logger()->flush();
   for (auto const* ast_expr : _ast_expressions) {
-    auto result    = execute(*ast_expr, execution_mode::MATERIALIZE);
     auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
+    SIRIUS_LOG_INFO("[DBG] gpu_expression_executor::execute expr class={} return_type={}",
+                    static_cast<int>(duck_expr->expression_class),
+                    duck_expr->return_type.ToString());
+    spdlog::default_logger()->flush();
+    auto result = execute(*ast_expr, execution_mode::MATERIALIZE);
+    SIRIUS_LOG_INFO("[DBG] gpu_expression_executor::execute expr done");
+    spdlog::default_logger()->flush();
     post_process(*duck_expr, std::move(result));
+    SIRIUS_LOG_INFO("[DBG] gpu_expression_executor::execute post_process done");
+    spdlog::default_logger()->flush();
   }
+  SIRIUS_LOG_INFO("[DBG] gpu_expression_executor::execute all exprs done");
+  spdlog::default_logger()->flush();
 
   return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
 }

@@ -67,6 +67,14 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt,
                                                 execution_mode mode)
 {
+  // SQLNULL constants are always null; encode as all-null INT8 (consistent with
+  // the cpu_source_task convention for SQLNULL columns on the GPU).
+  if (alt.return_type.id() == sirius::type_id::SQLNULL) {
+    auto scalar =
+      std::make_unique<cudf::numeric_scalar<int8_t>>(int8_t{}, /*valid=*/false, _stream, _mr);
+    return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+  }
+
   auto const cudf_type = sirius::get_cudf_type(alt.return_type);
   bool const is_valid  = !std::holds_alternative<sirius::null_value>(alt.payload);
 

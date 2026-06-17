@@ -316,6 +316,8 @@ pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_
 std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"cpu_source_task::compute_task"};
+  SIRIUS_LOG_INFO("[DBG] cpu_source_task::compute_task enter");
+  spdlog::default_logger()->flush();
 
   auto& g_state = _global_state->cast<cpu_source_task_global_state>();
   auto& source  = g_state.get_source_op();
@@ -368,7 +370,9 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
       auto& vec      = chunk.data[c];
       auto& validity = duckdb::FlatVector::Validity(vec);
       validity.SetAllInvalid(1);
-      if (!source.types[c].is_varchar()) {
+      if (!source.types[c].is_varchar() && source.types[c].id() != type_id::SQLNULL) {
+        // SQLNULL vectors have no valid data pointer; SetAllInvalid above already marks the
+        // single row as null, so there's nothing to zero.
         auto type_size = source.types[c].fixed_width_byte_size();
         if (type_size > 0) { std::memset(duckdb::FlatVector::GetData(vec), 0, type_size); }
       }
@@ -379,10 +383,11 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
   source.exhausted.store(true);
 
-  SIRIUS_LOG_DEBUG("[cpu_source_task] Produced {} data batches from {} source",
-                   batches.size(),
-                   source.collection ? "ColumnDataCollection"
-                                     : (source.produce_single_row ? "DUMMY_SCAN" : "EMPTY_RESULT"));
+  SIRIUS_LOG_INFO("[DBG] cpu_source_task: produced {} data batches from {} source",
+                  batches.size(),
+                  source.collection ? "ColumnDataCollection"
+                                    : (source.produce_single_row ? "DUMMY_SCAN" : "EMPTY_RESULT"));
+  spdlog::default_logger()->flush();
 
   return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
 }

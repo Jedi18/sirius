@@ -67,6 +67,9 @@ void validate_operator_output_types(const op::operator_data* data,
       return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
+      // SQLNULL columns are stored as all-null INT8 on the GPU (see cpu_source_task); skip the
+      // type check rather than calling get_cudf_type() which would throw for SQLNULL.
+      if (expected_types[c].id() == type_id::SQLNULL) { continue; }
       cudf::data_type expected_cudf = sirius::get_cudf_type(expected_types[c]);
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {

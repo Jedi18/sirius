@@ -162,3 +162,22 @@ call gpu_processing("SELECT rowID FROM issue_56 WHERE dataDecTwo IS NOT DISTINCT
 ----
 1
 4
+
+# Simple scan of a VALUES clause containing only NULLs (SQLNULL-typed column).
+# SQLNULL columns are encoded as all-null INT8 on the GPU; the result must be one NULL row.
+query I
+SELECT b FROM (VALUES (NULL)) t(b);
+----
+NULL
+
+# NOT EXISTS with a VALUES clause containing only NULLs (SQLNULL-typed join key).
+# The condition `t.a = r.b` is always NULL (never TRUE), so NOT EXISTS is always TRUE
+# and all rows from t should be returned.
+query I
+SELECT a FROM (VALUES (1), (2), (3)) t(a)
+WHERE NOT EXISTS (SELECT 1 FROM (VALUES (NULL), (NULL)) r(b) WHERE t.a = r.b)
+ORDER BY a;
+----
+1
+2
+3

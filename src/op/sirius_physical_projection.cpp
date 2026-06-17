@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -46,6 +47,10 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
+  SIRIUS_LOG_INFO(
+    "[DBG] PROJECTION enter batches={} exprs={}", input_batches.size(), select_list.size());
+  spdlog::default_logger()->flush();
+
   /// TODO: the operator should choose the execution strategy based on statistics and a deeper
   /// understand of the trade-offs between the different strategies. See:
   /// https://github.com/sirius-db/sirius/issues/636
@@ -56,11 +61,18 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto projected_table = gpu_expression_executor.execute(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    auto tbl_view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    SIRIUS_LOG_INFO(
+      "[DBG] PROJECTION batch rows={} cols={}", tbl_view.num_rows(), tbl_view.num_columns());
+    spdlog::default_logger()->flush();
+    auto projected_table = gpu_expression_executor.execute(tbl_view);
+    SIRIUS_LOG_INFO("[DBG] PROJECTION batch done");
+    spdlog::default_logger()->flush();
     output_batches.push_back(
       sirius::make_data_batch(std::move(projected_table), *batch.get_memory_space(), stream));
   }
+  SIRIUS_LOG_INFO("[DBG] PROJECTION done");
+  spdlog::default_logger()->flush();
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 

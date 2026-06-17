@@ -18,6 +18,7 @@
 
 #include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
+#include "op/scan/cpu_source_task.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -100,9 +101,15 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs =
-      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
-    _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+    if (source_operator->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+      auto gs = std::make_shared<op::scan::cpu_source_task_global_state>(
+        pipeline, &source_operator->Cast<op::sirius_physical_cpu_source>());
+      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+    } else {
+      auto gs =
+        std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+    }
   }
 }
 
@@ -231,6 +238,49 @@ void task_creator::manager_loop()
         for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
           destination_data_repositories.push_back(
             port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
+        }
+
+        // CPU_SOURCE has no input ports — run the scan task inline rather than
+        // looping on all_ports_empty() (which would immediately exit with no work).
+        if (node->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          size_t operator_id = node->get_operator_id();
+          auto cpu_global    = std::dynamic_pointer_cast<op::scan::cpu_source_task_global_state>(
+            _gpu_operator_global_state_map.at(operator_id));
+          if (!cpu_global) {
+            throw std::runtime_error("[task_creator] CPU_SOURCE global state cast failed");
+          }
+
+          auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
+          auto task        = std::make_unique<op::scan::cpu_source_task>(
+            get_next_task_id(),
+            destination_data_repositories.empty() ? nullptr : destination_data_repositories[0],
+            std::move(local_state),
+            cpu_global);
+
+          auto reservation_info = task->get_estimated_reservation_size_info();
+          auto reservation      = _mem_res_mgr.request_reservation(
+            cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+            reservation_info.reservation_size);
+          if (!reservation) {
+            throw std::runtime_error(
+              "[task_creator] Failed to acquire HOST reservation for CPU_SOURCE");
+          }
+          auto* local =
+            dynamic_cast<pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+          if (!local) {
+            throw std::runtime_error("[task_creator] CPU_SOURCE local state cast failed");
+          }
+          local->set_reservation(std::move(reservation), reservation_info);
+
+          auto consumers = task->get_output_consumers();
+          auto output    = task->compute_task(cudf::get_default_stream());
+          task->publish_output(*output, cudf::get_default_stream());
+          task.reset();
+
+          for (auto* consumer : consumers) {
+            this->schedule(consumer);
+          }
+          return;
         }
 
         // Create all possible tasks until all ports are empty
