@@ -245,8 +245,11 @@ void task_creator::manager_loop()
               "task_creator: cpu_source_op has no downstream data repository");
           }
 
-          auto global_state =
-            std::make_shared<op::scan::cpu_source_task_global_state>(pipeline, cpu_src);
+          auto* sirius_ctx_ptr =
+            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+          auto telemetry_ctx = sirius_ctx_ptr ? sirius_ctx_ptr->get_telemetry_context() : nullptr;
+          auto global_state  = std::make_shared<op::scan::cpu_source_task_global_state>(
+            pipeline, cpu_src, std::move(telemetry_ctx));
           auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
           auto task_id     = get_next_task_id();
           auto task        = std::make_unique<op::scan::cpu_source_task>(

@@ -40,8 +40,11 @@ namespace sirius::op::scan {
 // cpu_source_task_global_state
 //===----------------------------------------------------------------------===//
 cpu_source_task_global_state::cpu_source_task_global_state(
-  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline, sirius_physical_cpu_source* source_op)
-  : sirius_pipeline_task_global_state(std::move(pipeline)), _op(*source_op)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+  sirius_physical_cpu_source* source_op,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  : sirius_pipeline_task_global_state(std::move(pipeline), std::move(telemetry_context)),
+    _op(*source_op)
 {
 }
 
