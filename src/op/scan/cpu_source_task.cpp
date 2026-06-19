@@ -22,6 +22,8 @@
 #include "helper/utils.hpp"
 #include "log/logging.hpp"
 
+#include <cudf/null_mask.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -138,8 +140,10 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       // so cuDF's type dispatcher has a concrete type to work with.
       total_size += static_cast<size_t>(num_rows) * sizeof(int8_t);
     }
-    // Validity mask
-    total_size += utils::ceil_div_8(static_cast<size_t>(num_rows));
+    // Validity mask — sized to cudf's bitmask_allocation_size_bytes so that
+    // reconstruct_column can pass the buffer directly to cudf::column without
+    // cudf reading beyond the allocation when it accesses a full bitmask word.
+    total_size += cudf::bitmask_allocation_size_bytes(num_rows);
   }
 
   if (total_size == 0) {
@@ -209,11 +213,12 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       size_t data_size      = static_cast<size_t>(str_pos);
       offset += data_size;
 
-      // Write mask
+      // Write mask — sized to cudf::bitmask_allocation_size_bytes so that
+      // reconstruct_column passes a cudf-compatible buffer to cudf::column.
       size_t mask_offset = offset;
-      size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
+      size_t mask_size   = cudf::bitmask_allocation_size_bytes(num_rows);
       auto* mask_ptr     = base_ptr + mask_offset;
-      std::memset(mask_ptr, 0xFF, mask_size);
+      std::memset(mask_ptr, 0xFF, mask_size);  // init to all-valid; clear invalid bits below
       for (duckdb::idx_t r = 0; r < chunk.size(); r++) {
         if (!validity.RowIsValid(r)) { mask_ptr[r / 8] &= ~(1 << (r % 8)); }
       }
@@ -248,7 +253,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       offset += data_size;
 
       size_t mask_offset = offset;
-      size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
+      size_t mask_size   = cudf::bitmask_allocation_size_bytes(num_rows);
       std::memset(base_ptr + mask_offset, 0x00, mask_size);  // all rows invalid
       offset += mask_size;
       nulls = num_rows;
@@ -270,11 +275,12 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       std::memcpy(base_ptr + data_offset, duckdb::FlatVector::GetData(vec), data_size);
       offset += data_size;
 
-      // Write mask
+      // Write mask — sized to cudf::bitmask_allocation_size_bytes so that
+      // reconstruct_column passes a cudf-compatible buffer to cudf::column.
       size_t mask_offset = offset;
-      size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
+      size_t mask_size   = cudf::bitmask_allocation_size_bytes(num_rows);
       auto* mask_ptr     = base_ptr + mask_offset;
-      std::memset(mask_ptr, 0xFF, mask_size);
+      std::memset(mask_ptr, 0xFF, mask_size);  // init to all-valid; clear invalid bits below
       for (duckdb::idx_t r = 0; r < chunk.size(); r++) {
         if (!validity.RowIsValid(r)) {
           mask_ptr[r / 8] &= ~(1 << (r % 8));
