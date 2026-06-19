@@ -226,6 +226,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/io/gpu_ingestible.cpp
+    src/op/scan/cpu_source_task.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
