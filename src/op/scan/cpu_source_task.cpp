@@ -133,8 +133,11 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       total_size += string_bytes;
     } else if (types[c].id() != type_id::SQLNULL) {
       total_size += static_cast<size_t>(num_rows) * types[c].fixed_width_byte_size();
+    } else {
+      // SQLNULL: cuDF has no untyped-null column type. Represent as INT8 (1 byte/row, all-null)
+      // so cuDF's type dispatcher has a concrete type to work with.
+      total_size += static_cast<size_t>(num_rows) * sizeof(int8_t);
     }
-    // SQLNULL: zero data bytes — only the validity mask (all-invalid) contributes
     // Validity mask
     total_size += utils::ceil_div_8(static_cast<size_t>(num_rows));
   }
@@ -171,8 +174,9 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     cudf::size_type nulls = 0;
 
     cucascade::memory::column_metadata col{};
-    // SQLNULL has no cuDF equivalent — represent as EMPTY (all-null column, no data bytes).
-    col.type_id  = (sirius_t.id() == type_id::SQLNULL) ? cudf::type_id::EMPTY
+    // SQLNULL has no cuDF equivalent — represent as INT8 (all-null, zeroed data) so cuDF's
+    // type dispatcher has a concrete type. The all-null validity mask makes data values irrelevant.
+    col.type_id  = (sirius_t.id() == type_id::SQLNULL) ? cudf::type_id::INT8
                                                        : sirius::get_cudf_type(sirius_t).id();
     col.num_rows = num_rows;
     col.scale    = 0;
@@ -235,17 +239,23 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       col.children.push_back(std::move(offsets_child));
 
     } else if (sirius_t.id() == type_id::SQLNULL) {
-      // SQLNULL column: no data bytes, all rows invalid. Represented as cudf::EMPTY.
+      // SQLNULL column: represented as INT8 with zeroed data and all-null mask.
+      // cuDF's type dispatcher requires a concrete type; INT8 satisfies that.
+      // Data values are semantically irrelevant since all rows are invalid.
+      size_t data_offset = offset;
+      size_t data_size   = static_cast<size_t>(num_rows) * sizeof(int8_t);
+      std::memset(base_ptr + data_offset, 0, data_size);
+      offset += data_size;
+
       size_t mask_offset = offset;
       size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
-      auto* mask_ptr     = base_ptr + mask_offset;
-      std::memset(mask_ptr, 0x00, mask_size);  // all rows invalid
+      std::memset(base_ptr + mask_offset, 0x00, mask_size);  // all rows invalid
       offset += mask_size;
       nulls = num_rows;
 
-      col.has_data         = false;
-      col.data_offset      = 0;
-      col.data_size        = 0;
+      col.has_data         = true;
+      col.data_offset      = data_offset;
+      col.data_size        = data_size;
       col.null_count       = nulls;
       col.has_null_mask    = true;
       col.null_mask_offset = mask_offset;

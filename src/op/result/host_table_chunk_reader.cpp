@@ -310,7 +310,10 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
   // type (_types), so that we never call copy_string on non-string data (e.g. when projection
   // output column order doesn't match the plan and we have int where plan expects string).
   for (size_t col_idx = 0; col_idx < _column_readers.size(); ++col_idx) {
-    auto& vec            = chunk.data[col_idx];
+    auto& vec = chunk.data[col_idx];
+    // SQLNULL columns have no data to copy — the vector is already an all-null constant vector
+    // after chunk.Initialize(). Attempting to copy INT8 data and cast to SQLNULL would throw.
+    if (vec.GetType().id() == duckdb::LogicalTypeId::SQLNULL) { continue; }
     auto const actual_id = _column_readers[col_idx].cudf_col_type.id();
     if (actual_id == cudf::type_id::STRING) {
       // Stored data is string: read with copy_string into a VARCHAR vector, then cast if needed.
