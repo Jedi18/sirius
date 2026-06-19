@@ -270,7 +270,7 @@ void task_creator::manager_loop()
           task.reset();  // triggers mark_task_completed()
 
           for (auto* consumer : consumers) {
-            _task_scheduler->schedule(consumer);
+            this->schedule(consumer);
           }
         } catch (...) {
           SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution");
