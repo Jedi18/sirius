@@ -67,6 +67,8 @@ void validate_operator_output_types(const op::operator_data* data,
       return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
+      // SQLNULL has no cuDF equivalent — skip type validation for these columns.
+      if (expected_types[c].id() == sirius::type_id::SQLNULL) { continue; }
       cudf::data_type expected_cudf = sirius::get_cudf_type(expected_types[c]);
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {

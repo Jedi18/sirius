@@ -18,7 +18,9 @@
 
 #include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
+#include "op/scan/cpu_source_task.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
@@ -220,6 +222,64 @@ void task_creator::manager_loop()
     node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
+
+    // CPU_SOURCE operators are run as cpu_source_task on the bounded pool rather
+    // than as gpu_pipeline_task. The base all_ports_empty() returns true for
+    // source-only operators (no input ports), so the normal while-loop below
+    // would never fire. Instead we create, reserve memory for, and execute the
+    // cpu_source_task inline, then schedule the downstream consumers.
+    if (auto* cpu_src = dynamic_cast<op::sirius_physical_cpu_source*>(node)) {
+      _bounded_pool->dispatch(std::move(slot), [this, cpu_src]() mutable {
+        try {
+          auto pipeline = cpu_src->get_pipeline();
+
+          // The data repo is the "scan" port on the first downstream operator
+          // (wired by materialize_repository_wiring).
+          cucascade::shared_data_repository* data_repo = nullptr;
+          for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
+            data_repo = port_info.next_operator->get_port(port_info.next_operator_port_name)->repo;
+            break;
+          }
+          if (!data_repo) {
+            throw std::runtime_error(
+              "task_creator: cpu_source_op has no downstream data repository");
+          }
+
+          auto global_state =
+            std::make_shared<op::scan::cpu_source_task_global_state>(pipeline, cpu_src);
+          auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
+          auto task_id     = get_next_task_id();
+          auto task        = std::make_unique<op::scan::cpu_source_task>(
+            task_id, data_repo, std::move(local_state), global_state);
+
+          auto reservation_info = task->get_estimated_reservation_size_info();
+          auto reservation      = _mem_res_mgr.request_reservation(
+            cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+            reservation_info.reservation_size);
+          if (!reservation) {
+            throw std::runtime_error(
+              "task_creator: failed to acquire HOST memory reservation for cpu_source_task");
+          }
+          task->local_state()->cast<pipeline::sirius_pipeline_task_local_state>().set_reservation(
+            std::move(reservation), reservation_info);
+
+          auto consumers   = task->get_output_consumers();
+          auto stream      = cudf::get_default_stream();
+          auto output_data = task->compute_task(stream);
+          task->publish_output(*output_data, stream);
+          task.reset();  // triggers mark_task_completed()
+
+          for (auto* consumer : consumers) {
+            _task_scheduler->schedule(consumer);
+          }
+        } catch (...) {
+          SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution");
+          _task_scheduler->terminate_query(std::current_exception());
+          stop();
+        }
+      });
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {

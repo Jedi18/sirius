@@ -128,9 +128,10 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
         if (validity.RowIsValid(r)) { string_bytes += string_data[r].GetSize(); }
       }
       total_size += string_bytes;
-    } else {
+    } else if (types[c].id() != type_id::SQLNULL) {
       total_size += static_cast<size_t>(num_rows) * types[c].fixed_width_byte_size();
     }
+    // SQLNULL: zero data bytes — only the validity mask (all-invalid) contributes
     // Validity mask
     total_size += utils::ceil_div_8(static_cast<size_t>(num_rows));
   }
@@ -167,7 +168,9 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     cudf::size_type nulls = 0;
 
     cucascade::memory::column_metadata col{};
-    col.type_id  = sirius::get_cudf_type(sirius_t).id();
+    // SQLNULL has no cuDF equivalent — represent as EMPTY (all-null column, no data bytes).
+    col.type_id  = (sirius_t.id() == type_id::SQLNULL) ? cudf::type_id::EMPTY
+                                                       : sirius::get_cudf_type(sirius_t).id();
     col.num_rows = num_rows;
     col.scale    = 0;
     if (sirius_t.is_decimal()) { col.scale = static_cast<int32_t>(sirius_t.decimal_scale()); }
@@ -228,6 +231,22 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       offsets_child.data_size     = offsets_size;
       col.children.push_back(std::move(offsets_child));
 
+    } else if (sirius_t.id() == type_id::SQLNULL) {
+      // SQLNULL column: no data bytes, all rows invalid. Represented as cudf::EMPTY.
+      size_t mask_offset = offset;
+      size_t mask_size   = utils::ceil_div_8(static_cast<size_t>(num_rows));
+      auto* mask_ptr     = base_ptr + mask_offset;
+      std::memset(mask_ptr, 0x00, mask_size);  // all rows invalid
+      offset += mask_size;
+      nulls = num_rows;
+
+      col.has_data         = false;
+      col.data_offset      = 0;
+      col.data_size        = 0;
+      col.null_count       = nulls;
+      col.has_null_mask    = true;
+      col.null_mask_offset = mask_offset;
+      col.null_mask_size   = mask_size;
     } else {
       // Fixed-width column
       size_t type_size = sirius_t.fixed_width_byte_size();
@@ -341,7 +360,7 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
       auto& vec      = chunk.data[c];
       auto& validity = duckdb::FlatVector::Validity(vec);
       validity.SetAllInvalid(1);
-      if (!source.types[c].is_varchar()) {
+      if (!source.types[c].is_varchar() && source.types[c].id() != type_id::SQLNULL) {
         auto type_size = source.types[c].fixed_width_byte_size();
         if (type_size > 0) { std::memset(duckdb::FlatVector::GetData(vec), 0, type_size); }
       }
