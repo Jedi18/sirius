@@ -52,14 +52,15 @@ static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQu
 }
 
 /**
- * Fixture that creates small in-memory tables with NULLs and provides
- * compare_gpu_vs_cpu() to verify the GPU transparent path matches DuckDB CPU.
+ * Fixture that materialises small nullable datasets as parquet files (the only
+ * scan path the GPU supports) and exposes them as views.  Each fixture instance
+ * writes to its own temp directory so tests are isolated.
  *
- * Tables:
- *   null_int(id, a, b)  — integers; a and b each have 2 NULL rows out of 5
- *   null_str(id, s, n)  — mixed VARCHAR/integer; s and n each have 2 NULLs
- *   null_left(id, k)    — left side for join tests; k has 2 NULLs
- *   null_right(k, v)    — right side for join tests; one NULL key row
+ * Views created:
+ *   null_int(id INT, a INT, b INT)    — a and b each have 2 NULL rows out of 5
+ *   null_str(id INT, s VARCHAR, n INT) — s and n each have 2 NULLs
+ *   null_left(id INT, k INT)           — k has 2 NULLs; left side for joins
+ *   null_right(k INT, v INT)           — one NULL key row; right side for joins
  */
 class NullHandlingFixture {
  public:
@@ -76,9 +77,47 @@ class NullHandlingFixture {
       con          = std::make_unique<duckdb::Connection>(*db);
     }
 
+    // Write alongside the existing TPC-H parquet test data so the Sirius
+    // parquet IO backend can reach the files via the same path it uses for
+    // the pre-committed fixtures.  /tmp/ is on a different mount point and
+    // inaccessible through the configured IO context.
+    parquet_dir = fs::path(__FILE__).parent_path() / "data" / "parquet_nulls";
+    fs::create_directories(parquet_dir);
+
+    // Write parquet files with CPU (gpu_execution=false) before enabling GPU.
+    con->Query("SET gpu_execution = false;");
+    write_parquet("null_int",
+                  "SELECT 1::INT AS id, 1::INT    AS a, 10::INT   AS b "
+                  "UNION ALL SELECT 2, NULL::INT,         20 "
+                  "UNION ALL SELECT 3, 3,                 NULL::INT "
+                  "UNION ALL SELECT 4, NULL::INT,         NULL::INT "
+                  "UNION ALL SELECT 5, 5,                 50");
+    write_parquet("null_str",
+                  "SELECT 1::INT AS id, 'alpha'::VARCHAR AS s, 1::INT    AS n "
+                  "UNION ALL SELECT 2,  NULL::VARCHAR,          2 "
+                  "UNION ALL SELECT 3,  'gamma',                NULL::INT "
+                  "UNION ALL SELECT 4,  NULL::VARCHAR,          NULL::INT "
+                  "UNION ALL SELECT 5,  'epsilon',              5");
+    write_parquet("null_left",
+                  "SELECT 1::INT AS id, 1::INT    AS k "
+                  "UNION ALL SELECT 2, NULL::INT "
+                  "UNION ALL SELECT 3, 3 "
+                  "UNION ALL SELECT 4, NULL::INT "
+                  "UNION ALL SELECT 5, 5");
+    write_parquet("null_right",
+                  "SELECT 1::INT    AS k, 100::INT AS v "
+                  "UNION ALL SELECT 3,    300 "
+                  "UNION ALL SELECT NULL::INT, 999");
+
+    create_view("null_int");
+    create_view("null_str");
+    create_view("null_left");
+    create_view("null_right");
+
     con->Query("SET gpu_execution = true;");
-    setup_tables();
   }
+
+  ~NullHandlingFixture() { fs::remove_all(parquet_dir); }
 
   void compare_gpu_vs_cpu(const std::string& query)
   {
@@ -123,54 +162,23 @@ class NullHandlingFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
-  void setup_tables()
+  void write_parquet(const std::string& name, const std::string& select_sql)
   {
-    // id  a     b
-    //  1  1    10
-    //  2  NULL 20
-    //  3  3    NULL
-    //  4  NULL NULL
-    //  5  5    50
-    require_ok("DROP TABLE IF EXISTS null_int");
-    require_ok("CREATE TEMP TABLE null_int (id INTEGER, a INTEGER, b INTEGER)");
-    require_ok(
-      "INSERT INTO null_int VALUES (1,1,10),(2,NULL,20),(3,3,NULL),(4,NULL,NULL),(5,5,50)");
+    auto path = (parquet_dir / (name + ".parquet")).string();
+    require_ok("COPY (" + select_sql + ") TO '" + path + "' (FORMAT PARQUET)");
+  }
 
-    // id  s         n
-    //  1  'alpha'   1
-    //  2  NULL      2
-    //  3  'gamma'   NULL
-    //  4  NULL      NULL
-    //  5  'epsilon' 5
-    require_ok("DROP TABLE IF EXISTS null_str");
-    require_ok("CREATE TEMP TABLE null_str (id INTEGER, s VARCHAR, n INTEGER)");
-    require_ok(
-      "INSERT INTO null_str VALUES "
-      "(1,'alpha',1),(2,NULL,2),(3,'gamma',NULL),(4,NULL,NULL),(5,'epsilon',5)");
-
-    // id  k
-    //  1  1
-    //  2  NULL
-    //  3  3
-    //  4  NULL
-    //  5  5
-    require_ok("DROP TABLE IF EXISTS null_left");
-    require_ok("CREATE TEMP TABLE null_left (id INTEGER, k INTEGER)");
-    require_ok("INSERT INTO null_left VALUES (1,1),(2,NULL),(3,3),(4,NULL),(5,5)");
-
-    // k     v
-    //  1   100
-    //  3   300
-    //  NULL 999
-    require_ok("DROP TABLE IF EXISTS null_right");
-    require_ok("CREATE TEMP TABLE null_right (k INTEGER, v INTEGER)");
-    require_ok("INSERT INTO null_right VALUES (1,100),(3,300),(NULL,999)");
+  void create_view(const std::string& name)
+  {
+    auto path = (parquet_dir / (name + ".parquet")).string();
+    require_ok("CREATE OR REPLACE VIEW " + name + " AS SELECT * FROM read_parquet('" + path + "')");
   }
 
  public:
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
   std::unique_ptr<NullsConfigEnvGuard> config_guard;
+  fs::path parquet_dir;
 };
 
 }  // namespace
@@ -247,7 +255,7 @@ TEST_CASE_METHOD(NullHandlingFixture,
 }
 
 TEST_CASE_METHOD(NullHandlingFixture,
-                 "gpu_execution nulls - aggregate over all-NULL column is NULL",
+                 "gpu_execution nulls - aggregate over all-NULL input is NULL",
                  "[integration][gpu_execution][aggregate][nulls]")
 {
   compare_gpu_vs_cpu("SELECT sum(a), min(a), max(a) FROM null_int WHERE a IS NULL");
