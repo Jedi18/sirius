@@ -1135,7 +1135,7 @@ int32_t read_single_int32(cucascade::data_batch& batch)
 // Mirrors the pattern from test_physical_ungrouped_aggregate.cpp.
 namespace {
 
-std::unique_ptr<duckdb::Expression> make_first_expr()
+duckdb::unique_ptr<duckdb::Expression> make_first_expr()
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
   children.push_back(
