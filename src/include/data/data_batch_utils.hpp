@@ -129,6 +129,18 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
+/// @copydoc make_data_batch(cudf::table&&, memory_space&, rmm::cuda_stream_view, uint64_t)
+inline std::shared_ptr<cucascade::data_batch> make_data_batch(
+  std::unique_ptr<cudf::table> table,
+  cucascade::memory::memory_space& memory_space,
+  rmm::cuda_stream_view writer_stream,
+  uint64_t batch_id)
+{
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), memory_space, writer_stream);
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+}
+
 /**
  * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording the writer
  * event.
