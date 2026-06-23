@@ -28,6 +28,13 @@
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
+#include <helper/type_conversions.hpp>
+#include <op/sirius_physical_ungrouped_aggregate.hpp>
+#include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
 using namespace sirius;
 using namespace cucascade;
@@ -1124,6 +1131,47 @@ int32_t read_single_int32(cucascade::data_batch& batch)
 
 }  // namespace
 
+// Build a first(col0 :: INT32) aggregate node list for use in local/merge operator constructors.
+// Mirrors the pattern from test_physical_ungrouped_aggregate.cpp.
+namespace {
+
+std::unique_ptr<duckdb::Expression> make_first_expr()
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0));
+  return duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+    duckdb::AggregateFunction("first",
+                              {duckdb::LogicalType::INTEGER},
+                              duckdb::LogicalType::INTEGER,
+                              0,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr),
+    std::move(children),
+    nullptr,
+    nullptr,
+    duckdb::AggregateType::NON_DISTINCT);
+}
+
+duckdb::vector<std::unique_ptr<sirius::ast::node>> make_first_aggregate_nodes()
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+  exprs.push_back(make_first_expr());
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
+
+}  // namespace
+
 TEST_CASE("Ungrouped merge NTH_ELEMENT respects batch ordering",
           "[operator][merge_ungrouped_agg][first]")
 {
@@ -1168,4 +1216,61 @@ TEST_CASE("Ungrouped merge NTH_ELEMENT respects batch ordering",
     ro.clear();
     REQUIRE(read_single_int32(*result) == 10);
   }
+}
+
+TEST_CASE("sirius_physical_ungrouped_aggregate_merge first() uses source batch ordering",
+          "[operator][merge_ungrouped_agg][first]")
+{
+  // Regression test for non-deterministic first() under concurrent scan tasks.
+  //
+  // Two scan batches arrive at the local aggregate in reverse completion order
+  // (B finishes before A even though A was scanned first). The merge operator
+  // must still return A's value (10) because the source_id mapping records
+  // scan order, not completion order.
+  //
+  // This test exercises the full production path:
+  //   sirius_physical_ungrouped_aggregate::execute()   -> populates output_to_source_id_
+  //   sirius_physical_ungrouped_aggregate_merge::execute() -> sorts by source_batch_id
+  // Neither the dynamic_cast(child_op) branch nor the source-ID lookup is
+  // exercised by the existing [first] test that calls gpu_merge_impl directly.
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+
+  duckdb::vector<sirius::logical_type> types =
+    sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
+
+  sirius_physical_ungrouped_aggregate local_op(
+    types, make_first_aggregate_nodes(), 0, duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+
+  // The child_op constructor deep-copies aggregates and sets child_op = &local_op.
+  // The merge's execute() uses child_op to resolve output_batch_id -> source_batch_id.
+  sirius_physical_ungrouped_aggregate_merge merge_op(&local_op);
+
+  // batch_a is created first → lower batch_id = scan-order first.
+  auto batch_a = make_single_value_batch(10, *mem_space);
+  auto batch_b = make_single_value_batch(20, *mem_space);
+  REQUIRE(batch_a->get_batch_id() < batch_b->get_batch_id());
+
+  // Simulate reverse completion order: task for B finishes before task for A.
+  auto out_b = local_op.execute(pipelineable_operator_data({batch_b}), cudf::get_default_stream());
+  auto out_a = local_op.execute(pipelineable_operator_data({batch_a}), cudf::get_default_stream());
+
+  // Feed the partial results to the merge in completion order [B_out, A_out].
+  std::vector<std::shared_ptr<cucascade::data_batch>> merge_inputs;
+  for (auto& b : dynamic_cast<const pipelineable_operator_data&>(*out_b).get_data_batches()) {
+    merge_inputs.push_back(b);
+  }
+  for (auto& b : dynamic_cast<const pipelineable_operator_data&>(*out_a).get_data_batches()) {
+    merge_inputs.push_back(b);
+  }
+
+  auto result =
+    merge_op.execute(pipelineable_operator_data(merge_inputs), cudf::get_default_stream());
+
+  auto& result_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(result_batches.size() == 1);
+
+  // A was scanned first (lower source batch_id), so first() must return 10, not 20.
+  REQUIRE(read_single_int32(*result_batches[0]) == 10);
 }
