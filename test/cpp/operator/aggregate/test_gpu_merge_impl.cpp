@@ -23,6 +23,8 @@
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -1084,4 +1086,86 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
                                                      *mem_space);
   ro_batches.clear();
   validate_order_by(input.batches, *output_batch, order_key_idx, column_order);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers and tests for first() batch-ordering correctness
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Creates a 1-row INT32 batch whose single column holds `value`.
+// Represents a local first() partial result (one scalar per input batch).
+std::shared_ptr<cucascade::data_batch> make_single_value_batch(int32_t value,
+                                                               memory_space& mem_space)
+{
+  auto stream = cudf::get_default_stream();
+  auto scalar = cudf::make_numeric_scalar(cudf::data_type{cudf::type_id::INT32}, stream);
+  scalar->set_valid_async(true, stream);
+  using ScalarType = cudf::scalar_type_t<int32_t>;
+  static_cast<ScalarType*>(scalar.get())->set_value(value, stream);
+  auto col = cudf::make_column_from_scalar(*scalar, 1, stream, mem_space.get_default_allocator());
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table =
+    std::make_unique<cudf::table>(std::move(cols), stream, mem_space.get_default_allocator());
+  return sirius::make_data_batch(std::move(table), mem_space, stream);
+}
+
+// Reads the single INT32 value from a 1-row, 1-column batch.
+int32_t read_single_int32(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  auto tv = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  int32_t v{};
+  cudaMemcpy(&v, tv.column(0).data<int32_t>(), sizeof(v), cudaMemcpyDeviceToHost);
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("Ungrouped merge NTH_ELEMENT respects batch ordering",
+          "[operator][merge_ungrouped_agg][first]")
+{
+  // Simulate two local first() partial results: batch A (value 10) was scanned before
+  // batch B (value 20).  Batch A is created first, so batch_id(A) < batch_id(B).
+  auto* mem_space = get_shared_mem_space();
+
+  auto batch_a = make_single_value_batch(10, *mem_space);
+  auto batch_b = make_single_value_batch(20, *mem_space);
+
+  REQUIRE(batch_a->get_batch_id() < batch_b->get_batch_id());
+
+  const std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::NTH_ELEMENT};
+  const std::vector<std::optional<cudf::size_type>> nth_index = {0};
+
+  SECTION("In scan order [A, B] -> first() returns A's value (10)")
+  {
+    std::vector<read_only_data_batch> ro;
+    ro.push_back(batch_a->to_read_only());
+    ro.push_back(batch_b->to_read_only());
+    auto result = gpu_merge_impl::merge_ungrouped_aggregate(
+      ro, aggregates, nth_index, cudf::get_default_stream(), *mem_space);
+    ro.clear();
+    REQUIRE(read_single_int32(*result) == 10);
+  }
+
+  SECTION("Reverse order [B, A] sorted by batch_id -> first() returns A's value (10, the fix)")
+  {
+    std::vector<read_only_data_batch> ro;
+    ro.push_back(batch_b->to_read_only());
+    ro.push_back(batch_a->to_read_only());
+
+    // Reproduce the sort that sirius_physical_ungrouped_aggregate_merge applies
+    // when any NTH_ELEMENT aggregate is present.
+    std::stable_sort(
+      ro.begin(), ro.end(), [](const read_only_data_batch& x, const read_only_data_batch& y) {
+        return x.get_batch_id() < y.get_batch_id();
+      });
+
+    auto result = gpu_merge_impl::merge_ungrouped_aggregate(
+      ro, aggregates, nth_index, cudf::get_default_stream(), *mem_space);
+    ro.clear();
+    REQUIRE(read_single_int32(*result) == 10);
+  }
 }
