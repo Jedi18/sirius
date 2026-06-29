@@ -3,6 +3,7 @@
 #
 # Example:
 #   bash tools/log_analyzer/run_small_data_overhead_sweep.sh 1 1 3 5 9
+#   bash tools/log_analyzer/run_small_data_overhead_sweep.sh --all-tpch 10
 #
 # Outputs:
 #   small_data_overhead_runs/<timestamp>_sf<SF>/
@@ -27,11 +28,14 @@ OUTPUT_ROOT="$PROJECT_DIR/small_data_overhead_runs"
 PARQUET_DIR=""
 PINNING_MODE="none"
 OPERATORS=(PARTITION MERGE_GROUP_BY)
+MODE="grouped-aggregate"
+ALL_TPCH=false
 
 usage() {
     cat <<'EOF'
 Usage:
   bash tools/log_analyzer/run_small_data_overhead_sweep.sh [options] <scale_factor> <query_numbers...>
+  bash tools/log_analyzer/run_small_data_overhead_sweep.sh --all-tpch [options] <scale_factor>
 
 Options:
   --config <path>          Sirius config file. Default: $SIRIUS_CONFIG_FILE or test/cpp/integration/integration.yaml
@@ -40,12 +44,18 @@ Options:
   --parquet-dir <path>     Existing TPC-H parquet directory. Default: runner chooses/generates test_datasets/tpch_parquet_sf<SF>
   --output-root <path>     Parent output directory. Default: ./small_data_overhead_runs
   --pinning-mode <mode>    Passed to run_tpch_parquet.sh. Default: none
+  --all-tpch               Run Q1 through Q22.
+  --mode <mode>            Summary mode: grouped-aggregate or operators.
+                           Default: grouped-aggregate, which only counts MERGE_GROUP_BY and
+                           the direct PARTITION pipeline feeding it.
   --operators <list...>    Target operators until -- or first numeric scale factor.
+                           Used for --mode operators and detail labels.
                            Default: PARTITION MERGE_GROUP_BY
 
 Examples:
   bash tools/log_analyzer/run_small_data_overhead_sweep.sh 1 1
   bash tools/log_analyzer/run_small_data_overhead_sweep.sh 10 3 5 9 10
+  bash tools/log_analyzer/run_small_data_overhead_sweep.sh --all-tpch --iterations 4 10
   bash tools/log_analyzer/run_small_data_overhead_sweep.sh --iterations 5 --operators PARTITION MERGE_GROUP_BY MERGE_AGGREGATE -- 10 1 9
 EOF
 }
@@ -84,6 +94,14 @@ while [[ $# -gt 0 ]]; do
             PINNING_MODE="$2"
             shift 2
             ;;
+        --all-tpch)
+            ALL_TPCH=true
+            shift
+            ;;
+        --mode)
+            MODE="$2"
+            shift 2
+            ;;
         --operators)
             shift
             OPERATORS=()
@@ -114,14 +132,35 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ $# -lt 2 ]]; then
+if [[ "$ALL_TPCH" = true ]]; then
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 2
+    fi
+else
+    if [[ $# -lt 2 ]]; then
+        usage
+        exit 2
+    fi
+fi
+
+if [[ "$MODE" != "grouped-aggregate" && "$MODE" != "operators" ]]; then
+    echo "ERROR: --mode must be grouped-aggregate or operators" >&2
+    exit 2
+fi
+
+if [[ "$ALL_TPCH" = false && $# -lt 2 ]]; then
     usage
     exit 2
 fi
 
 SF="$1"
 shift
-QUERIES=("$@")
+if [[ "$ALL_TPCH" = true ]]; then
+    QUERIES=($(seq 1 22))
+else
+    QUERIES=("$@")
+fi
 
 if ! is_integer "$ITERATIONS" || [[ "$ITERATIONS" -lt 1 ]]; then
     echo "ERROR: --iterations must be a positive integer" >&2
@@ -154,12 +193,14 @@ mkdir -p "$RAW_DIR" "$ANALYSIS_DIR"
     echo "config=$CONFIG_FILE"
     echo "parquet_dir=${PARQUET_DIR:-<runner default>}"
     echo "pinning_mode=$PINNING_MODE"
+    echo "mode=$MODE"
     echo "operators=${OPERATORS[*]}"
 } > "$RUN_DIR/run_info.txt"
 
 echo "Running Sirius queries with trace logging..."
 echo "  run dir: $RUN_DIR"
 echo "  queries: ${QUERIES[*]}"
+echo "  mode: $MODE"
 echo "  target operators: ${OPERATORS[*]}"
 
 runner_args=(--iterations "$ITERATIONS" --timeout "$TIMEOUT" --pinning-mode "$PINNING_MODE")
@@ -192,19 +233,24 @@ for q in "${QUERIES[@]}"; do
     python3 "$PARSE_LOGS" "$query_log" --out "$query_out"
 
     echo "  Q${q}: summarizing target overhead"
-    python3 "$SUMMARIZER" "$query_out" --operators "${OPERATORS[@]}" --out "$query_out" \
+    python3 "$SUMMARIZER" "$query_out" --mode "$MODE" --operators "${OPERATORS[@]}" --out "$query_out" \
         > "$query_out/summarizer_stdout.log"
 done
 
 echo ""
 echo "Combining per-query summaries..."
-python3 - "$RUN_DIR" "${QUERIES[@]}" <<'PY'
+python3 - "$RUN_DIR" "$SF" "$ITERATIONS" "$MODE" "${OPERATORS[*]}" "${QUERIES[@]}" <<'PY'
 import csv
+import statistics
 import sys
 from pathlib import Path
 
 run_dir = Path(sys.argv[1])
-queries = sys.argv[2:]
+sf = sys.argv[2]
+iterations = sys.argv[3]
+mode = sys.argv[4]
+operators = sys.argv[5]
+queries = sys.argv[6:]
 analysis_dir = run_dir / "analysis"
 
 summary_rows = []
@@ -245,17 +291,116 @@ def as_float(value):
     except (TypeError, ValueError):
         return None
 
+def fmt_ms(value):
+    return "n/a" if value is None else f"{value:.2f} ms"
+
+def fmt_pct(value):
+    return "n/a" if value is None else f"{value:.2f}%"
+
+def median(values):
+    values = [v for v in values if v is not None]
+    return statistics.median(values) if values else None
+
+def max_or_none(values):
+    values = [v for v in values if v is not None]
+    return max(values) if values else None
+
+def min_or_none(values):
+    values = [v for v in values if v is not None]
+    return min(values) if values else None
+
+def classify(pct):
+    if pct is None:
+        return "unknown"
+    if pct > 10.0:
+        return "pursue simplification"
+    if pct < 1.0:
+        return "not worth simplification"
+    return "measure more / workload-specific"
+
+by_query = {}
+for row in summary_rows:
+    by_query.setdefault(row["query"], []).append(row)
+
+query_stat_rows = []
+for query in sorted(by_query, key=lambda q: int(q[1:])):
+    rows = by_query[query]
+    pct_span_gap = [as_float(row.get("pct_span_plus_gap")) for row in rows]
+    pct_exec_sum = [as_float(row.get("pct_execution_sum")) for row in rows]
+    span_gap = [as_float(row.get("target_span_plus_gap_ms")) for row in rows]
+    exec_sum = [as_float(row.get("target_execution_sum_ms")) for row in rows]
+    durations = [as_float(row.get("duration_ms")) for row in rows]
+    target_counts = [
+        int(float(row.get("target_pipeline_count") or 0))
+        for row in rows
+    ]
+    median_pct_span_gap = median(pct_span_gap)
+    query_stat_rows.append(
+        {
+            "query": query,
+            "iterations": len(rows),
+            "target_pipeline_count_max": max(target_counts) if target_counts else 0,
+            "duration_ms_median": median(durations),
+            "span_plus_gap_ms_median": median(span_gap),
+            "span_plus_gap_ms_max": max_or_none(span_gap),
+            "pct_span_plus_gap_median": median_pct_span_gap,
+            "pct_span_plus_gap_min": min_or_none(pct_span_gap),
+            "pct_span_plus_gap_max": max_or_none(pct_span_gap),
+            "exec_sum_ms_median": median(exec_sum),
+            "pct_exec_sum_median": median(pct_exec_sum),
+            "decision": classify(median_pct_span_gap),
+        }
+    )
+
+write_csv(run_dir / "issue_query_stats.csv", query_stat_rows)
+
 lines = [
     "# Small-Data Overhead Sweep Summary",
     "",
     f"- Run directory: `{run_dir}`",
+    f"- Scale factor: `{sf}`",
+    f"- Iterations per query: `{iterations}`",
+    f"- Mode: `{mode}`",
+    f"- Operators: `{operators}`",
     f"- Queries: `{', '.join(f'Q{q}' for q in queries)}`",
     "",
-    "## Query Results",
+    "## Issue Summary",
     "",
-    "| Query | Iteration Folder | Duration | Span+Gap | % Span+Gap | Exec Sum | % Exec Sum | Decision |",
-    "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    "Default mode measures only the grouped-aggregate split path: `MERGE_GROUP_BY` plus the direct `PARTITION` pipeline feeding it. This excludes hash-join partition pipelines.",
+    "",
+    "| Query | Iterations | Target Pipelines | Median Duration | Median Span+Gap | Median % Span+Gap | Max % Span+Gap | Median Exec Sum | Median % Exec Sum | Decision |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
 ]
+
+for row in query_stat_rows:
+    lines.append(
+        "| "
+        + " | ".join(
+            [
+                row["query"],
+                str(row["iterations"]),
+                str(row["target_pipeline_count_max"]),
+                fmt_ms(row["duration_ms_median"]),
+                fmt_ms(row["span_plus_gap_ms_median"]),
+                fmt_pct(row["pct_span_plus_gap_median"]),
+                fmt_pct(row["pct_span_plus_gap_max"]),
+                fmt_ms(row["exec_sum_ms_median"]),
+                fmt_pct(row["pct_exec_sum_median"]),
+                row["decision"],
+            ]
+        )
+        + " |"
+    )
+
+lines.extend(
+    [
+        "",
+        "## Per-Iteration Results",
+    "",
+        "| Query | Iteration Folder | Duration | Span+Gap | % Span+Gap | Exec Sum | % Exec Sum | Decision |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+)
 
 for row in summary_rows:
     duration = as_float(row.get("duration_ms"))
@@ -285,6 +430,7 @@ lines.extend(
         "",
         "## Outputs",
         "",
+        "- `issue_query_stats.csv`",
         "- `combined_small_data_overhead.csv`",
         "- `combined_small_data_overhead_details.csv`",
         "- Per-query parsed artifacts under `analysis/q<N>/`",
