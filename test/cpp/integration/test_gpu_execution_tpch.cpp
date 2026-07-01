@@ -4641,6 +4641,50 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
 }
 
+// Empty result: WHERE false produces an EMPTY_RESULT operator feeding directly
+// into RESULT_COLLECTOR. Before the fix this hung because no GPU task ever ran
+// to call mark_completed() — signal_query_complete() now handles it.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty result (WHERE false)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
+}
+
+// Dummy scan: SELECT with no FROM clause uses DUMMY_SCAN (one null row) as the
+// terminal pipeline source. Same hang risk as EMPTY_RESULT.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - dummy scan (SELECT literal)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select 42 as x;");
+}
+
+// Subquery via COLUMN_DATA_SCAN: DuckDB materializes the inner query as a
+// ColumnDataCollection and re-scans it via cpu_source_task into the outer
+// GPU pipeline.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - subquery result via column data scan",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu(
+    "select n_name from nation"
+    " where n_nationkey in (select n_nationkey from nation where n_name = 'FRANCE');");
+}
+
+// CTE reuse: both branches of the join read the same materialized CTE, so the
+// cpu_source_task must publish to multiple downstream data repositories. Before
+// the fix the second consumer received no data.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - CTE reuse (cpu_source fans to multiple pipelines)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu(
+    "with top_nations as (select n_nationkey from nation where n_regionkey = 1)"
+    " select count(*) from top_nations t1"
+    " join top_nations t2 on t1.n_nationkey = t2.n_nationkey;");
+}
+
 //===----------------------------------------------------------------------===//
 // pin_table tests
 //===----------------------------------------------------------------------===//
