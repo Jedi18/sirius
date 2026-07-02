@@ -402,11 +402,6 @@ def cmd_run(args) -> int:
             failures.append((name, str(e)))
             print(f"[run] {name}: FAILED ({e})", file=sys.stderr)
             continue
-        if args.raw_json_dir:
-            rj = Path(args.raw_json_dir)
-            rj.mkdir(parents=True, exist_ok=True)
-            with open(rj / f"{name}.json", "w") as jf:
-                json.dump(tree, jf, indent=2)
         before = len(all_rows)
         walk_tree(tree, ctx, all_rows)
         added = all_rows[before:]
@@ -703,12 +698,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="print the #990 collapse-decision confusion matrix at this row threshold T",
-    )
-    pr.add_argument(
-        "--raw-json-dir",
-        default=None,
-        help="also save each query's raw profiling JSON to DIR/<query>.json (for debugging "
-        "the profile schema)",
     )
     pr.set_defaults(func=cmd_run)
     return p
