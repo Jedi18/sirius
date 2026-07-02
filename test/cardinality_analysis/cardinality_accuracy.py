@@ -117,6 +117,35 @@ def _to_int(value) -> int | None:
     return None
 
 
+# Candidate keys under which an operator's estimated cardinality may appear in the profiling
+# JSON's extra_info. "__estimated_cardinality__" is what this repo's DuckDB sets via
+# PhysicalOperator::SetEstimatedCardinality, but we fall back to other spellings / a fuzzy
+# match so a build variation does not silently blank the whole est column.
+_EST_KEYS = (
+    "__estimated_cardinality__",
+    "Estimated Cardinality",
+    "estimated_cardinality",
+)
+
+
+def extract_estimated(node: dict) -> int | None:
+    """Pull the estimated cardinality out of a profiling operator node, robustly."""
+    extra = node.get("extra_info")
+    if not isinstance(extra, dict):
+        return None
+    for k in _EST_KEYS:
+        if k in extra:
+            return _to_int(extra[k])
+    # Fuzzy fallback: any key mentioning both "estimat" and "cardinal" with a numeric value.
+    for k, v in extra.items():
+        kl = str(k).lower()
+        if "estimat" in kl and "cardinal" in kl:
+            val = _to_int(v)
+            if val is not None:
+                return val
+    return None
+
+
 def qerror(est: int | None, act: int | None) -> float | None:
     """Symmetric q-error = max(est,act)/min(est,act), flooring both at 1 to avoid div-by-0.
 
@@ -246,10 +275,7 @@ def walk_tree(
 
     op_type = node.get("operator_type")
     if op_type is not None:
-        extra = node.get("extra_info")
-        est = None
-        if isinstance(extra, dict):
-            est = _to_int(extra.get("__estimated_cardinality__"))
+        est = extract_estimated(node)
         act = _to_int(node.get("operator_cardinality"))
         op_id = counter[0]
         counter[0] += 1
@@ -376,6 +402,11 @@ def cmd_run(args) -> int:
             failures.append((name, str(e)))
             print(f"[run] {name}: FAILED ({e})", file=sys.stderr)
             continue
+        if args.raw_json_dir:
+            rj = Path(args.raw_json_dir)
+            rj.mkdir(parents=True, exist_ok=True)
+            with open(rj / f"{name}.json", "w") as jf:
+                json.dump(tree, jf, indent=2)
         before = len(all_rows)
         walk_tree(tree, ctx, all_rows)
         added = all_rows[before:]
@@ -672,6 +703,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="print the #990 collapse-decision confusion matrix at this row threshold T",
+    )
+    pr.add_argument(
+        "--raw-json-dir",
+        default=None,
+        help="also save each query's raw profiling JSON to DIR/<query>.json (for debugging "
+        "the profile schema)",
     )
     pr.set_defaults(func=cmd_run)
     return p
