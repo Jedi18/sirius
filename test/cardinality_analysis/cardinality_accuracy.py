@@ -52,12 +52,13 @@ Usage
   # 1. Populate a TPC-H database once (needs the tpch extension / network for INSTALL):
   python3 cardinality_accuracy.py prepare --db tpch_sf1.duckdb --tpch-sf 1
 
-  # 2. Collect the tidy per-operator table:
+  # 2. Collect the tidy per-operator table, with a summary and a #990 collapse-decision
+  #    confusion matrix at a candidate threshold of 1,000,000 rows:
   python3 cardinality_accuracy.py run \
       --db tpch_sf1.duckdb \
       --queries-dir ../tpch_performance/tpch_queries/orig \
       --workload tpch --scale-factor 1 \
-      --out results/tpch_sf1.csv --summary
+      --out results/tpch_sf1.csv --summary --threshold 1000000
 
 Output: one CSV row per operator, columns:
   workload, scale_factor, engine, query, op_id, depth, op_type, op_name,
@@ -80,7 +81,8 @@ import tempfile
 from pathlib import Path
 
 # Physical operator types that map to the operators #990 considers collapsing.
-# Kept here for the --summary breakdown; the CSV records the raw op_type regardless.
+# Used for the --summary breakdown and the --threshold confusion matrix; the CSV records
+# the raw op_type regardless.
 COLLAPSE_CANDIDATES = {
     "HASH_GROUP_BY",
     "PERFECT_HASH_GROUP_BY",
@@ -187,8 +189,6 @@ def run_one_query(
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"timeout after {timeout}s")
-    finally:
-        pass
 
     if proc.returncode != 0:
         err = (proc.stderr or "").strip().splitlines()
@@ -372,6 +372,8 @@ def cmd_run(args) -> int:
 
     if args.summary:
         print_summary(all_rows)
+    if args.threshold is not None:
+        print_confusion(all_rows, args.threshold)
     return 0
 
 
@@ -388,7 +390,8 @@ def _percentile(sorted_vals: list[float], p: float) -> float:
 
 def print_summary(rows: list[dict]) -> None:
     """Per-operator-type q-error percentiles and under-estimate stats -- a sanity read,
-    not the full analysis (thresholds/confusion-matrix live in the analysis step)."""
+    not the full analysis (thresholds/confusion-matrix live in --threshold / analysis).
+    """
     by_type: dict[str, list[dict]] = {}
     for r in rows:
         if r["qerror"] is None:
@@ -424,6 +427,111 @@ def print_summary(rows: list[dict]) -> None:
         "\n  * = operator type #990 may collapse. 'under%' = fraction where actual > estimated "
         "(collapse-unsafe direction);\n    'worst_under' = largest actual/estimated ratio seen "
         "for that type (the blast radius of a bad collapse)."
+    )
+
+
+def print_confusion(rows: list[dict], threshold: int) -> None:
+    """#990 collapse-decision confusion matrix at a candidate threshold (in rows).
+
+    For each collapse-candidate operator with a known estimate and actual:
+      decision = collapse if est_rows <= T ;  reality = small if act_rows <= T
+    yielding four outcomes -- the only one that causes a crash is WRONG-COLLAPSE
+    (est <= T but act > T: we collapsed, then overflowed).
+    """
+    T = threshold
+    cand = [
+        r
+        for r in rows
+        if r["op_type"] in COLLAPSE_CANDIDATES
+        and r["est_rows"] is not None
+        and r["act_rows"] is not None
+    ]
+
+    print(
+        f"\n=== #990 collapse-decision confusion matrix @ threshold T = {T:,} rows ==="
+    )
+    print(f"(collapse-candidate operators with known est & act: {len(cand)})")
+    if not cand:
+        print("  no qualifying operators -- check --threshold and that candidates ran.")
+        return
+
+    correct_collapse = [r for r in cand if r["est_rows"] <= T and r["act_rows"] <= T]
+    wrong_collapse = [
+        r for r in cand if r["est_rows"] <= T and r["act_rows"] > T
+    ]  # DANGER
+    wrong_keep = [r for r in cand if r["est_rows"] > T and r["act_rows"] <= T]  # missed
+    correct_keep = [r for r in cand if r["est_rows"] > T and r["act_rows"] > T]
+    n = len(cand)
+
+    def pct(x):
+        return f"{100 * len(x) / n:5.1f}%"
+
+    print("\n                              actual <= T        actual > T")
+    print(
+        f"  est <= T  (would collapse)  {len(correct_collapse):>6} correct   "
+        f"{len(wrong_collapse):>6} WRONG-COLLAPSE (OOM)"
+    )
+    print(
+        f"  est >  T  (would keep)      {len(wrong_keep):>6} wrong-keep "
+        f"{len(correct_keep):>6} correct"
+    )
+
+    print(
+        f"\n  correct-collapse : {len(correct_collapse):>5}  ({pct(correct_collapse)})  safe optimization"
+    )
+    print(
+        f"  WRONG-COLLAPSE   : {len(wrong_collapse):>5}  ({pct(wrong_collapse)})  <- these overflow / OOM"
+    )
+    print(
+        f"  wrong-keep       : {len(wrong_keep):>5}  ({pct(wrong_keep)})  missed optimization (safe)"
+    )
+    print(f"  correct-keep     : {len(correct_keep):>5}  ({pct(correct_keep)})")
+
+    would_collapse = len(correct_collapse) + len(wrong_collapse)
+    if would_collapse:
+        rate = 100 * len(wrong_collapse) / would_collapse
+        print(
+            f"\n  Of operators DuckDB calls small (est <= T): {would_collapse}; "
+            f"wrong-collapse rate = {len(wrong_collapse)}/{would_collapse} = {rate:.1f}%"
+        )
+
+    if wrong_collapse:
+        overruns = sorted(r["act_rows"] / T for r in wrong_collapse)
+        print(
+            f"  Overrun (actual/T) among wrong-collapses: median {_percentile(overruns, 0.5):.1f}x, "
+            f"p95 {_percentile(overruns, 0.95):.1f}x, max {max(overruns):.1f}x"
+        )
+        worst = sorted(
+            wrong_collapse,
+            key=lambda r: r["act_rows"] / max(r["est_rows"], 1),
+            reverse=True,
+        )[:10]
+        print("  Worst offenders (est said small, reality did not):")
+        for r in worst:
+            print(
+                f"    {r['query']:<8} {r['op_type']:<22} est={r['est_rows']:>12,} "
+                f"act={r['act_rows']:>12,}  overrun={r['act_rows'] / T:>6.1f}x"
+            )
+    else:
+        print(
+            "  No wrong-collapses at this threshold: collapse would be safe on this workload."
+        )
+
+    # Per-candidate-type wrong-collapse breakdown.
+    print("\n  wrong-collapse by operator type:")
+    by_type: dict[str, list[dict]] = {}
+    for r in wrong_collapse:
+        by_type.setdefault(r["op_type"], []).append(r)
+    if by_type:
+        for op_type in sorted(by_type, key=lambda t: -len(by_type[t])):
+            grp = by_type[op_type]
+            worst = max(r["act_rows"] / T for r in grp)
+            print(f"    {op_type:<24} {len(grp):>4}   worst overrun {worst:.1f}x")
+    else:
+        print("    (none)")
+    print(
+        "\n  NOTE: T is in ROWS. The real #990 budget is BYTES -- rerun once est_bytes/act_bytes "
+        "are\n  derived (see README) for the byte-accurate decision."
     )
 
 
@@ -485,6 +593,12 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--out", required=True, help="output CSV path")
     pr.add_argument(
         "--summary", action="store_true", help="print per-operator q-error summary"
+    )
+    pr.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help="print the #990 collapse-decision confusion matrix at this row threshold T",
     )
     pr.set_defaults(func=cmd_run)
     return p

@@ -52,12 +52,12 @@ Schema verified against this repo's `duckdb/` submodule — see the docstring in
 #    or point `run` at a .duckdb produced by ../tpch_performance/generate_tpch_data.sh).
 pixi run python3 cardinality_accuracy.py prepare --db tpch_sf1.duckdb --tpch-sf 1
 
-# 2. Collect the tidy per-operator table + a quick summary.
+# 2. Collect the tidy table, a q-error summary, and the #990 confusion matrix at T rows.
 pixi run python3 cardinality_accuracy.py run \
     --db tpch_sf1.duckdb \
     --queries-dir ../tpch_performance/tpch_queries/orig \
     --workload tpch --scale-factor 1 \
-    --out results/tpch_sf1.csv --summary
+    --out results/tpch_sf1.csv --summary --threshold 1000000
 ```
 
 For **TPC-DS**, generate data via `../../test/tpcds_performance/generate_tpcds_data.sh`,
@@ -90,19 +90,35 @@ cardinalities, matching production.
 | `under_estimate` | `True` when `act_rows > est_rows` (the collapse-unsafe direction) |
 | `rows_scanned` | base-scan estimate for table scans |
 
-The `--summary` flag prints per-operator-type q-error percentiles, under-estimate rate, and
-the worst actual/estimated ratio, flagging the operator types #990 would collapse (`*`).
+### `--summary`
+
+Per-operator-type q-error percentiles, under-estimate rate, and worst actual/estimated
+ratio, flagging the operator types #990 would collapse (`*`). A first sanity read.
+
+### `--threshold T`
+
+The core #990 read: the collapse-decision **confusion matrix** over collapse-candidate
+operators, at a candidate threshold `T` (in rows). For each such operator,
+`decision = collapse if est ≤ T`, `reality = small if act ≤ T`:
+
+- **correct-collapse** (est ≤ T, act ≤ T) — safe optimization
+- **WRONG-COLLAPSE** (est ≤ T, act > T) — the crash case; also reports the overrun
+  distribution (`actual/T`) and worst offenders
+- **wrong-keep** (est > T, act ≤ T) — missed optimization (safe)
+- **correct-keep** (est > T, act > T)
+
+The number that gates the feature is the **wrong-collapse rate** = wrong-collapse ÷ (all
+operators DuckDB called small), plus the overrun tail. Sweep a few `T` values to find one
+where both are acceptably small.
 
 ## What this harness does NOT do (next steps)
 
 - **Bytes.** Operator output row-widths are not in the profiling JSON, and the real #990
-  threshold is a *byte* budget. Derive `est_bytes`/`act_bytes` in the analysis step by
-  joining these rows against per-query output schemas (from `EXPLAIN`/logical types and the
-  fixed-width sizing Sirius already uses in
-  [sirius_physical_table_scan.cpp:39](../../src/op/sirius_physical_table_scan.cpp#L39)).
-- **Threshold sweep + confusion matrix.** The core #990 deliverable — for a candidate
-  threshold `T`, the {correctly-collapse, correctly-keep, wrongly-collapse, wrongly-keep}
-  matrix and the overrun-ratio tail — is computed from this CSV in the analysis step.
+  threshold is a *byte* budget, so `--threshold` is currently in rows. Derive
+  `est_bytes`/`act_bytes` by joining these rows against per-query output schemas (from
+  `EXPLAIN`/logical types and the fixed-width sizing Sirius already uses in
+  [sirius_physical_table_scan.cpp:39](../../src/op/sirius_physical_table_scan.cpp#L39)),
+  then rerun the confusion matrix on bytes.
 - **Join Order Benchmark (JOB).** TPC-H is unusually easy for estimators (independent,
   uniform columns). Add TPC-DS (skew) and ideally JOB (correlated real data) before drawing
   a safety conclusion.
