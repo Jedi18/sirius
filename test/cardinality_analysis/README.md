@@ -37,8 +37,11 @@ DuckDB's JSON profiling emits estimated and actual rows for every operator in on
 
 We run each query with `gpu_execution=false` so DuckDB executes normally and the full
 per-operator tree is available (with `gpu_execution=true` Sirius collapses execution into
-one opaque operator and the tree is lost). The *estimate* is DuckDB's optimizer output and
-is identical either way, so this faithfully captures what #990 will act on.
+one opaque `EXTENSION`/`SIRIUS_GPU_EXECUTION` operator and the tree — including all
+estimates — is lost). The *estimate* is DuckDB's optimizer output and is identical either
+way, so this faithfully captures what #990 will act on. **`gpu_execution=false` is set
+automatically for every query**, because `build/release/duckdb` auto-loads Sirius with GPU
+execution ON by default; without disabling it you get one estimate-less row per query.
 
 Schema verified against this repo's `duckdb/` submodule — see the docstring in
 [`cardinality_accuracy.py`](cardinality_accuracy.py) for exact file:line citations.
@@ -69,10 +72,13 @@ cardinalities, matching production.
 
 ### Engines
 
-- `--engine duckdb` (default): plain DuckDB over native tables. Estimates are identical to
-  what Sirius sees, so this is the simplest faithful setup.
-- `--engine sirius`: `LOAD`s the extension (`-unsigned`) and sets `gpu_execution=false`.
-  Use for parquet workloads.
+Both disable `gpu_execution`; they differ only in whether the extension is `LOAD`ed.
+
+- `--engine duckdb` (default): assumes the binary already has Sirius available (the Sirius
+  build auto-loads it). Simplest setup.
+- `--engine sirius`: also `LOAD`s the extension explicitly (`-unsigned`) — for a binary that
+  does not auto-load it, or for parquet inputs where the Sirius footer-count callback gives
+  exact base cardinalities.
 
 ## Output
 

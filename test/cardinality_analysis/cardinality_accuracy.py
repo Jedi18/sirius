@@ -35,17 +35,18 @@ Verified against this repo's DuckDB submodule:
   - output-path pragma is `profile_output`      (duckdb/src/main/config.cpp:216)
 
 The estimate is DuckDB's optimizer output and is identical whether or not the GPU path
-runs, so we measure with `gpu_execution=false` (plain DuckDB execution) and read the full
-per-operator tree. With `gpu_execution=true` Sirius replaces execution with a single opaque
-operator and this tree would not be available -- so keep it false.
+runs, so we ALWAYS `SET gpu_execution=false` and read DuckDB's full per-operator tree. With
+gpu_execution=true Sirius replaces execution with a single opaque EXTENSION operator and this
+tree is not available. NOTE: build/release/duckdb auto-loads Sirius with gpu_execution ON by
+default, so this must be disabled explicitly even for --engine duckdb.
 
-Engines:
-  --engine duckdb  (default): plain DuckDB. Estimates on *native tables* are identical to
-                              what Sirius sees, so this is the simplest faithful setup.
-  --engine sirius           : LOAD the Sirius extension (needs -unsigned) and
-                              SET gpu_execution=false. Use this for *parquet* inputs so the
-                              Sirius parquet footer-count callback (exact base cardinality,
-                              src/sirius_extension.cpp:201) is active, matching production.
+Engines (both disable gpu_execution; the difference is only whether the extension is LOADed):
+  --engine duckdb  (default): assume the binary already has Sirius available (the Sirius
+                              build auto-loads it). Simplest setup.
+  --engine sirius           : also `LOAD` the extension explicitly (needs -unsigned), for a
+                              binary that does not auto-load it, or for parquet inputs where
+                              the Sirius footer-count callback (src/sirius_extension.cpp:201)
+                              provides exact base cardinalities.
 
 Usage
 -----
@@ -140,9 +141,15 @@ def build_run_script(
                 "--engine sirius requires --sirius-ext <path to .duckdb_extension>"
             )
         lines.append(f"LOAD '{sirius_ext}';")
-        # GPU execution off: we need DuckDB's per-operator profiling tree, and the estimate
-        # is identical either way. On would collapse execution into one opaque operator.
-        lines.append("SET gpu_execution=false;")
+    # Disable Sirius GPU interception UNCONDITIONALLY. The Sirius-enabled build/release/duckdb
+    # auto-loads the extension with gpu_execution ON by default, so without this the whole
+    # query collapses into a single opaque EXTENSION/SIRIUS_GPU_EXECUTION operator with no
+    # per-operator tree and no __estimated_cardinality__. With it OFF, DuckDB builds and
+    # profiles its normal plan and exposes per-operator estimates -- which are DuckDB's
+    # optimizer output either way, so this does not bias the measurement. On a vanilla DuckDB
+    # without Sirius this is an unknown-setting error, tolerated because run_one_query keys
+    # success off the profile file, not the exit code.
+    lines.append("SET gpu_execution=false;")
     # profile_output is the canonical name; profiling_output is an accepted alias.
     lines.append("PRAGMA enable_profiling='json';")
     lines.append(f"PRAGMA profile_output='{profile_path}';")
@@ -192,17 +199,21 @@ def run_one_query(
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"timeout after {timeout}s")
 
-    if proc.returncode != 0:
-        err = (proc.stderr or "").strip().splitlines()
-        raise RuntimeError(
-            f"duckdb exited {proc.returncode}: {err[-1] if err else 'no stderr'}"
-        )
-
+    # Key success off the profile file, not the exit code: a harmless unknown-setting error
+    # (e.g. SET gpu_execution on a non-Sirius binary) can make the CLI exit nonzero even
+    # though the query ran and the profile was written.
     if not os.path.exists(profile_path) or os.path.getsize(profile_path) == 0:
         err = (proc.stderr or "").strip().splitlines()
-        raise RuntimeError(
-            f"no profile written: {err[-1] if err else 'query may have errored'}"
+        detail = (
+            err[-1]
+            if err
+            else (
+                f"duckdb exited {proc.returncode}"
+                if proc.returncode
+                else "query may have errored"
+            )
         )
+        raise RuntimeError(f"no profile written: {detail}")
 
     try:
         with open(profile_path) as f:
@@ -367,7 +378,24 @@ def cmd_run(args) -> int:
             continue
         before = len(all_rows)
         walk_tree(tree, ctx, all_rows)
-        print(f"[run] {name}: {len(all_rows) - before} operators", file=sys.stderr)
+        added = all_rows[before:]
+        print(f"[run] {name}: {len(added)} operators", file=sys.stderr)
+        # Detect the "interception still on" failure mode: a single opaque Sirius operator
+        # with no estimates instead of DuckDB's per-operator tree.
+        if (
+            added
+            and all(r["est_rows"] is None for r in added)
+            and any(
+                r["op_type"] == "EXTENSION" or "SIRIUS" in (r["op_name"] or "").upper()
+                for r in added
+            )
+        ):
+            print(
+                f"[run] WARNING: {name} produced only a Sirius GPU operator with no "
+                "estimates -- GPU interception was NOT disabled. The binary must accept "
+                "'SET gpu_execution=false' (a Sirius setting); check it is the Sirius build.",
+                file=sys.stderr,
+            )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
