@@ -63,6 +63,8 @@ Usage
 Output: one CSV row per operator, columns:
   workload, scale_factor, engine, query, op_id, depth, op_type, op_name,
   est_rows, act_rows, qerror, under_estimate, rows_scanned
+With --threshold T, five more columns classify each row at that threshold:
+  is_candidate, would_collapse, actually_small, collapse_outcome, overrun_x
 
 Bytes are intentionally NOT emitted here: operator output row-widths are not in the
 profiling JSON. The real #990 threshold is a byte budget, so bytes are derived in the
@@ -303,6 +305,38 @@ def cmd_prepare(args) -> int:
     return proc.returncode
 
 
+def annotate_collapse_outcome(rows: list[dict], threshold: int) -> None:
+    """Add per-row #990 collapse-decision columns for a given threshold T (in rows).
+
+    Mutates each row in place. For collapse-candidate operators with a known estimate and
+    actual, `collapse_outcome` is one of correct_collapse / wrong_collapse / wrong_keep /
+    correct_keep (see print_confusion). Non-candidate rows, or rows missing est/act, get
+    blank outcome fields. This makes the classification queryable straight from the CSV; it
+    is threshold-specific, so re-running with a different T overwrites these columns.
+    """
+    T = threshold
+    for r in rows:
+        est, act = r["est_rows"], r["act_rows"]
+        cand = r["op_type"] in COLLAPSE_CANDIDATES
+        r["is_candidate"] = cand
+        r["would_collapse"] = "" if est is None else (est <= T)
+        r["actually_small"] = "" if act is None else (act <= T)
+        outcome = ""
+        overrun = ""
+        if cand and est is not None and act is not None:
+            small_est, small_act = est <= T, act <= T
+            outcome = {
+                (True, True): "correct_collapse",
+                (True, False): "wrong_collapse",  # collapsed then overflowed
+                (False, True): "wrong_keep",  # missed optimization
+                (False, False): "correct_keep",
+            }[(small_est, small_act)]
+            if outcome == "wrong_collapse":
+                overrun = round(act / T, 2)
+        r["collapse_outcome"] = outcome
+        r["overrun_x"] = overrun
+
+
 def cmd_run(args) -> int:
     queries = collect_queries(args)
     if not queries:
@@ -352,6 +386,17 @@ def cmd_run(args) -> int:
         "under_estimate",
         "rows_scanned",
     ]
+    # When a threshold is given, classify each row and add the outcome columns to the CSV
+    # (in addition to the console confusion matrix).
+    if args.threshold is not None:
+        annotate_collapse_outcome(all_rows, args.threshold)
+        fields += [
+            "is_candidate",
+            "would_collapse",
+            "actually_small",
+            "collapse_outcome",
+            "overrun_x",
+        ]
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()

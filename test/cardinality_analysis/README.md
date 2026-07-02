@@ -111,6 +111,19 @@ The number that gates the feature is the **wrong-collapse rate** = wrong-collaps
 operators DuckDB called small), plus the overrun tail. Sweep a few `T` values to find one
 where both are acceptably small.
 
+`--threshold` also adds five per-row columns to the CSV so the classification is queryable
+directly (not just in the console matrix):
+
+| column | meaning |
+|---|---|
+| `is_candidate` | operator type is one #990 would collapse |
+| `would_collapse` | `est_rows ≤ T` |
+| `actually_small` | `act_rows ≤ T` |
+| `collapse_outcome` | `correct_collapse` / `wrong_collapse` / `wrong_keep` / `correct_keep` (candidates only) |
+| `overrun_x` | `act_rows / T` for `wrong_collapse` rows (the overflow factor) |
+
+These are threshold-specific, so re-running with a different `T` overwrites them.
+
 ## What this harness does NOT do (next steps)
 
 - **Bytes.** Operator output row-widths are not in the profiling JSON, and the real #990
