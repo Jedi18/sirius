@@ -30,6 +30,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <mutex>
 #include <numeric>
 
 namespace sirius {
@@ -109,6 +110,44 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+  // --- #990 single-task collapse (Option B / B-bypass) ---
+  //
+  // When the converter decides (from the estimate) that this aggregate MIGHT be small enough
+  // to run in one task, it marks it collapse-capable via enable_collapse(): the aggregate's
+  // input edge is set to a FULL barrier (so all input is present when scheduled), and a
+  // "bypass" next-port to `bypass_downstream` (the operator that would otherwise read from
+  // MERGE) is added alongside the normal aggregate->partition next-port.
+  //
+  // At runtime get_next_task_input_data() measures the actual input bytes: if the whole input
+  // fits in one task (<= budget) it drains everything into a single task and sets _collapsed,
+  // so execute() aggregates + finalizes in one pass and sink() routes the finalized result
+  // straight to the downstream repo — leaving partition+merge with no input (never scheduled).
+  // If the input is larger, it degrades to the normal per-batch partial path feeding partition.
+  void enable_collapse(sirius_physical_operator* bypass_downstream,
+                       std::size_t single_task_budget_bytes)
+  {
+    _collapse_capable         = true;
+    _bypass_downstream        = bypass_downstream;
+    _single_task_budget_bytes = single_task_budget_bytes;
+  }
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+
+ private:
+  //! Set by the converter (plan time): this aggregate may collapse to a single task.
+  bool _collapse_capable = false;
+  //! Downstream consumer to route to when collapsed (identifies the bypass next-port).
+  sirius_physical_operator* _bypass_downstream = nullptr;
+  //! One-task byte budget; input measured <= this collapses (0 => not collapse-capable).
+  std::size_t _single_task_budget_bytes = 0;
+  //! Whether the collapse decision has been made yet (measured input once).
+  bool _collapse_decided = false;
+  //! Runtime decision, set in get_next_task_input_data before execute()/sink() of that task.
+  bool _collapsed = false;
+  //! Guards the collapse decision / drain against concurrent task-creator threads.
+  std::mutex _collapse_mutex;
 };
 
 }  // namespace op

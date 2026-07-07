@@ -92,5 +92,78 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   }
   return std::make_unique<pipelineable_operator_data>(results);
 }
+
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::get_next_task_input_data()
+{
+  // Not collapse-capable → today's behavior: one task per input batch.
+  if (!_collapse_capable) { return sirius_physical_operator::get_next_task_input_data(); }
+
+  std::lock_guard<std::mutex> lg(_collapse_mutex);
+
+  // Already decided NOT to collapse → keep serving per-batch tasks like the base operator.
+  if (_collapse_decided && !_collapsed) {
+    return sirius_physical_operator::get_next_task_input_data();
+  }
+  // Collapsed → the single task already drained everything.
+  if (_collapse_decided && _collapsed) { return nullptr; }
+
+  // First scheduling of a collapse-capable aggregate. Its input edge is a FULL barrier, so all
+  // input is present now; measure the true input size (same measurement the partition operator
+  // uses in determine_num_partitions) and decide.
+  std::uint64_t total_bytes = 0;
+  for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo) { continue; }
+    for (auto batch_id : port_ptr->repo->get_batch_ids(0)) {
+      auto batch = port_ptr->repo->get_data_batch_by_id(batch_id, 0);
+      if (!batch) { continue; }
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    }
+  }
+  _collapse_decided = true;
+
+  if (total_bytes > _single_task_budget_bytes) {
+    // Estimate said "small" but the data is actually large → fall back to the normal per-batch
+    // partial path feeding partition+merge. No collapse, no bypass (the runtime guard).
+    _collapsed = false;
+    return sirius_physical_operator::get_next_task_input_data();
+  }
+
+  // Collapse: drain ALL input batches into a single task (see ungrouped merge for the pattern).
+  _collapsed = true;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
+  for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo) { continue; }
+    while (auto batch = port_ptr->repo->pop_next_data_batch()) {
+      input_batch.push_back(std::move(batch));
+    }
+  }
+  if (input_batch.empty()) { return nullptr; }
+  return std::make_unique<pipelineable_operator_data>(input_batch);
+}
+
+void sirius_physical_grouped_aggregate::sink(const operator_data& output_data,
+                                             rmm::cuda_stream_view stream)
+{
+  // Non-collapsed → default fan-out (pushes to the partition next-port, as today).
+  if (!_collapsed) {
+    sirius_physical_operator::sink(output_data, stream);
+    return;
+  }
+  // Collapsed (B-bypass): execute() already produced the FINALIZED result, so route it
+  // straight to the downstream consumer's port and NOT to partition. Partition+merge then
+  // receive no input and are never scheduled; the pipeline-completion machinery still marks
+  // them finished and releases downstream's FULL barrier. Deposit-then-finish: this push
+  // completes within the aggregate task's sink, before pipeline completion propagates.
+  auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
+  for (auto& batch : pipelineable_output.get_data_batches()) {
+    for (auto& next_port_info : get_next_ports_after_sink()) {
+      if (next_port_info.next_operator == _bypass_downstream) {
+        next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name,
+                                                      batch);
+      }
+    }
+  }
+}
 }  // namespace op
 }  // namespace sirius
