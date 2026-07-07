@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -78,19 +79,52 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  cucascade::memory::memory_space* space = nullptr;
   for (auto const& input_batch : input_batches) {
-    auto* space = input_batch.get_memory_space();
-    if (!space) { continue; }
+    auto* batch_space = input_batch.get_memory_space();
+    if (!batch_space) { continue; }
+    space       = batch_space;
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
-                                                              *space);
+                                                              *batch_space);
     results.push_back(std::move(result));
   }
-  return std::make_unique<pipelineable_operator_data>(results);
+
+  // Two-phase (default): emit the per-batch partials; partition + merge finalize them.
+  if (!_collapsed) { return std::make_unique<pipelineable_operator_data>(results); }
+
+  // Collapsed single task (#990 B-bypass): all input arrived in this one task, so combine the
+  // partials and finalize HERE — producing the final result — then sink() routes it straight to
+  // the downstream consumer, skipping partition + merge entirely. This reuses the same merge +
+  // finalization the two-phase MERGE_GROUP_BY operator uses, so results are identical.
+  if (results.empty() || space == nullptr) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+  }
+  std::shared_ptr<::cucascade::data_batch> merged;
+  if (results.size() == 1) {
+    merged = results[0];
+  } else {
+    std::vector<::cucascade::read_only_data_batch> partials_ro;
+    partials_ro.reserve(results.size());
+    for (auto const& partial : results) {
+      partials_ro.push_back(partial->to_read_only());
+    }
+    merged = gpu_merge_impl::merge_grouped_aggregate(
+      partials_ro, static_cast<int>(group_idx.size()), cudf_aggregates, stream, *space);
+  }
+  auto finalized = finalize_merged_grouped_aggregate(merged,
+                                                     static_cast<int>(group_idx.size()),
+                                                     aggregate_slots,
+                                                     has_avg,
+                                                     has_count_distinct,
+                                                     stream);
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{finalized});
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::get_next_task_input_data()

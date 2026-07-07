@@ -192,78 +192,17 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
                                                      *input_batches[0].get_memory_space());
   }
 
-  // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
-  }
-
-  // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
-  // Release ownership of the merged table's columns so we can move (not copy) them.
-  // Acquire EXCLUSIVE lock since release_table() is a mutating operation
-  auto merged_mut    = merged->to_mutable();
-  auto* space        = merged_mut.get_memory_space();
-  auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols   = gpu_rep.release_table(stream)->release();
-  int num_group_cols = static_cast<int>(group_idx.size());
-
-  std::vector<std::unique_ptr<cudf::column>> output_cols;
-
-  // Move group key columns (zero-copy)
-  for (int i = 0; i < num_group_cols; ++i) {
-    output_cols.push_back(std::move(merged_cols[i]));
-  }
-
-  // Process each original aggregate
-  for (auto const& slot : aggregate_slots) {
-    if (slot.is_avg) {
-      int sum_col_idx   = num_group_cols + static_cast<int>(slot.cudf_idx);
-      int count_col_idx = num_group_cols + static_cast<int>(slot.cudf_idx) + 1;
-
-      auto sum_view   = merged_cols[sum_col_idx]->view();
-      auto count_view = merged_cols[count_col_idx]->view();
-
-      std::unique_ptr<cudf::column> avg_col;
-      bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
-      if (is_decimal) {
-        // DECIMAL: divide directly in fixed-point to preserve precision
-        avg_col = cudf::binary_operation(
-          sum_view, count_view, cudf::binary_operator::DIV, slot.output_type, stream, mr);
-      } else {
-        // Non-DECIMAL: cast to FLOAT64 and divide
-        auto sum_f64 = cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
-        auto count_f64 =
-          cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
-        avg_col = cudf::binary_operation(sum_f64->view(),
-                                         count_f64->view(),
-                                         cudf::binary_operator::DIV,
-                                         cudf::data_type{cudf::type_id::FLOAT64},
-                                         stream,
-                                         mr);
-      }
-
-      output_cols.push_back(std::move(avg_col));
-    } else if (slot.is_count_distinct) {
-      // The merged column is a LIST column (output of MERGE_SETS). Count elements per row to
-      // produce the final distinct count, then cast to INT64.
-      int col_idx      = num_group_cols + static_cast<int>(slot.cudf_idx);
-      auto list_view   = cudf::lists_column_view(merged_cols[col_idx]->view());
-      auto count_int32 = cudf::lists::count_elements(list_view, stream, mr);
-      auto count_int64 =
-        cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-      output_cols.push_back(std::move(count_int64));
-    } else {
-      // Move non-AVG, non-count-distinct aggregate columns directly (zero-copy)
-      int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
-      output_cols.push_back(std::move(merged_cols[col_idx]));
-    }
-  }
-
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
+  // Finalize (AVG / COUNT DISTINCT post-processing) via the shared helper, also used by the
+  // single-task collapsed grouped aggregate (#990). Returns `merged` unchanged when neither
+  // AVG nor COUNT DISTINCT is present.
+  auto finalized = finalize_merged_grouped_aggregate(merged,
+                                                     static_cast<int>(group_idx.size()),
+                                                     aggregate_slots,
+                                                     has_avg,
+                                                     has_count_distinct,
+                                                     stream);
   return std::make_unique<pipelineable_operator_data>(
-    std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{finalized});
 }
 }  // namespace op
 }  // namespace sirius

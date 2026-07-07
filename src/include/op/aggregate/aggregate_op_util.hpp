@@ -22,9 +22,15 @@
 
 #include <cudf/aggregation.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <memory>
 #include <optional>
 #include <vector>
+
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
 
 namespace sirius {
 namespace op {
@@ -92,6 +98,30 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Finalize a merged grouped-aggregate batch: apply the AVG (SUM/COUNT division) and
+ * COUNT DISTINCT (list element count) post-processing that turns the merge-able partial
+ * representation into the final output columns.
+ *
+ * Shared by the two-phase merge operator (sirius_physical_grouped_aggregate_merge) and the
+ * single-task collapsed grouped aggregate (#990), which both hold the same aggregate metadata.
+ * When there is no AVG or COUNT DISTINCT, `merged` is already final and is returned unchanged.
+ *
+ * @param merged            The merged partial batch (group keys + expanded aggregate columns).
+ * @param num_group_cols    Number of leading group-by key columns.
+ * @param aggregate_slots   One entry per original aggregate, describing AVG / COUNT DISTINCT.
+ * @param has_avg           Whether any aggregate is AVG.
+ * @param has_count_distinct Whether any aggregate is COUNT(DISTINCT ...).
+ * @param stream            CUDA stream.
+ */
+std::shared_ptr<cucascade::data_batch> finalize_merged_grouped_aggregate(
+  std::shared_ptr<cucascade::data_batch> merged,
+  int num_group_cols,
+  const std::vector<AggregateSlot>& aggregate_slots,
+  bool has_avg,
+  bool has_count_distinct,
+  rmm::cuda_stream_view stream);
 
 }  // namespace op
 }  // namespace sirius
