@@ -200,6 +200,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // wiring needs it to route the final sink pipeline's output there).
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
+  // Fusion eligibility walks the `_parent_op` chains, so it must run after the re-walk.
+  sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+    *sirius_physical_plan);
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

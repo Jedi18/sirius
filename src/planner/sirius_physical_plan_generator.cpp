@@ -664,6 +664,89 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   }
 }
 
+namespace {
+
+//! Composite terminals whose wiring emissions depend on their pipeline's shape in ways
+//! fusion has not been audited against (CTE fan-out, delim-join sibling references, direct
+//! join sinks); keep the merge boundary intact when the chain ends at one of these.
+bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& sink)
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  switch (sink.type) {
+    case T::CTE:
+    case T::LEFT_DELIM_JOIN:
+    case T::RIGHT_DELIM_JOIN:
+    case T::HASH_JOIN:
+    case T::NESTED_LOOP_JOIN: return false;
+    // Partition-family sinks decide num_partitions from their TOTAL input, so they must stay
+    // fed by a completed upstream pipeline whose single task sees everything. Fusing the
+    // merge in would stream per-partition merge output into sink() across multiple tasks and
+    // the partition count would never be set ("Num partitions was not set" at runtime).
+    // Chains with an intermediate between merge and PARTITION are unaffected: the
+    // intermediate is a dynamic pipeline-breaker sink and remains the fusion terminal.
+    case T::PARTITION:
+    case T::SORT_PARTITION: return false;
+    default: return true;
+  }
+}
+
+//! True when the merge can join its consumer's pipeline: every ancestor strictly between the
+//! merge and the first downstream sink is a plain single-child streaming intermediate, and
+//! that terminal sink supports fusion. Single-child intermediates guarantee no third party
+//! (CTE consumer, delim scan) can resolve wiring through an absorbed operator — any wiring
+//! anchor is a *parent* of some operator, and an absorbed intermediate's only child is the
+//! merge chain itself. Note `is_sink()` is dynamic for plain intermediates directly under a
+//! PARTITION / RIGHT_DELIM_JOIN (pipeline breakers), so chains toward join feeders terminate
+//! at that breaker and keep its total-input-size barrier.
+bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_operator& merge)
+{
+  // A delim join's distinct-top merge retargets its output to the delim scans' consumers via
+  // `owning_delim_join` wiring, which is emitted only for pipeline *sinks* — fusing the merge
+  // would silently drop those edges.
+  if (merge.owning_delim_join() != nullptr) { return false; }
+  for (auto* cur = merge.get_parent_op(); cur != nullptr; cur = cur->get_parent_op()) {
+    // First sink ancestor is the fusion terminal: the merge joins its pipeline.
+    if (cur->is_sink()) { return terminal_sink_supports_fusion(*cur); }
+    if (cur->is_source() || cur->children.size() != 1) { return false; }
+  }
+  // Chain ended without reaching any sink (e.g. a detached subtree top).
+  return false;
+}
+
+}  // namespace
+
+void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+  sirius::op::sirius_physical_operator& op)
+{
+  const bool fusion_enabled = duckdb::Config::FUSE_MERGE_PIPELINES;
+  // UNGROUPED_AGGREGATE_MERGE is deliberately not fusable: it has no PARTITION under it (the
+  // merge consumes the per-thread accumulator directly), and folding it into the collector's
+  // pipeline broke the partial→merge handoff on the legacy path (wrong AVG results).
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+    op.Cast<sirius::op::sirius_physical_grouped_aggregate_merge>()
+      .set_fuse_into_parent(fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+  } else if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N) {
+    op.Cast<sirius::op::sirius_physical_top_n_merge>().set_fuse_into_parent(
+      fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+  }
+
+  for (auto& child : op.children) {
+    if (child) { mark_fusable_merge_pipelines(*child); }
+  }
+  // Mirror set_parent_ops' descent into subtrees kept outside `children[]`. Merges inside a
+  // delim join's subtrees are rejected by the walk (owning_delim_join / excluded terminals),
+  // but visiting them keeps their flags in a defined state.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
+    if (delim.join) { mark_fusable_merge_pipelines(*delim.join); }
+    if (delim.distinct_root) { mark_fusable_merge_pipelines(*delim.distinct_root); }
+  }
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    mark_fusable_merge_pipelines(op.Cast<sirius::op::sirius_physical_result_collector>().plan);
+  }
+}
+
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {

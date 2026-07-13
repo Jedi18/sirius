@@ -1530,6 +1530,12 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetFuseMergePipelines(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::FUSE_MERGE_PIPELINES = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config FUSE_MERGE_PIPELINES to {}", Config::FUSE_MERGE_PIPELINES);
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1803,6 +1809,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  // Merge-pipeline downstream fusion toggle; see Config::FUSE_MERGE_PIPELINES in config.hpp.
+  config.AddExtensionOption(
+    "fuse_merge_pipelines",
+    "Fold streaming downstream operators (e.g. the result collector) into GROUP BY / TOP_N "
+    "merge pipelines so they run in a single pipeline task",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::FUSE_MERGE_PIPELINES),
+    SetFuseMergePipelines);
 
   // Add in config options for duckdb scan task
   // Default batch size

@@ -62,10 +62,23 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
   bool is_sink() const override { return true; }
 
+  //! When set (by `mark_fusable_merge_pipelines`), `build_pipelines` joins the consumer's
+  //! pipeline as an intermediate instead of cutting a boundary, so the merge and the
+  //! downstream streaming chain (typically the RESULT_COLLECTOR) run in one pipeline task.
+  //! `is_sink()` stays true — the flag affects pipeline membership, not the operator's role.
+  void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
+  [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+ private:
+  bool _fuse_into_parent = false;
 };
 
 }  // namespace op

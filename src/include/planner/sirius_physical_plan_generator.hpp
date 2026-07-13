@@ -209,6 +209,14 @@ class sirius_physical_plan_generator {
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 
+  //! Recursive post-pass that marks GROUP BY / TOP_N merge operators whose downstream is a
+  //! streaming dead end (plain single-child intermediates up to the first downstream sink)
+  //! as fusable into their consumer's pipeline (`Config::FUSE_MERGE_PIPELINES`). Requires
+  //! final `_parent_op` values, so the engine runs it right after the post-RESULT_COLLECTOR
+  //! `set_parent_ops` re-walk. Recomputes (rather than or-ing in) each flag so toggling the
+  //! setting between executions stays correct.
+  static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op);
+
  private:
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
   //! merge operators, scan companions, CPU_SOURCE) so the tree carries the full execution

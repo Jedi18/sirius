@@ -60,6 +60,15 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
+  // Merge-pipeline downstream fusion: when a GROUP BY / TOP_N merge operator's downstream is
+  // a streaming dead end (plain single-child intermediates up to the first downstream sink),
+  // the merge joins that consumer's pipeline instead of cutting a boundary, so merge and
+  // consumer run in one gpu_pipeline_task. Eligibility marking
+  // (`mark_fusable_merge_pipelines`) runs only on the engine's execute path, after the
+  // RESULT_COLLECTOR wrap — never in the bare conversion harness, so converter-level tests
+  // see unfused shapes unless they mark explicitly.
+  static bool FUSE_MERGE_PIPELINES;
+
   // Whether to fall back to duckdb execution after an error is detected
   static bool ENABLE_DUCKDB_FALLBACK;
 

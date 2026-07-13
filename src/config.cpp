@@ -41,6 +41,8 @@ bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
 bool Config::MODIFIED_PIPELINE = false;
 
+bool Config::FUSE_MERGE_PIPELINES = true;
+
 uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  ///< 50 MB
 uint64_t Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256ULL;
 

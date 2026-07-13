@@ -20,6 +20,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
@@ -49,6 +51,22 @@ convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& sr
     result.push_back(std::move(converted));
   }
   return result;
+}
+
+void sirius_physical_grouped_aggregate_merge::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // Fusable merge: downstream is a streaming dead end, so join the consumer's pipeline as an
+  // intermediate instead of cutting a boundary — the merge and the RESULT_COLLECTOR then run
+  // in one gpu_pipeline_task. The PARTITION child is still a sink and builds its own boundary,
+  // and the tree-parent wiring resolves it to this pipeline via operators[0] (this merge).
+  if (_fuse_into_parent) {
+    D_ASSERT(children.size() == 1);
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    children[0]->build_pipelines(current, meta_pipeline);
+    return;
+  }
+  sirius_physical_operator::build_pipelines(current, meta_pipeline);
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
