@@ -312,6 +312,11 @@ def time_query(con, qnum, use_gpu, profile_path=None):
     if use_gpu:
         log("  SET gpu_execution = true (GPU/sirius)")
         con.execute("SET gpu_execution = true;")
+        # A/B hook: extra SQL (e.g. "SET fuse_merge_pipelines = false;") applied to every
+        # GPU query, so engine settings can be benchmarked without a rebuild.
+        extra_sql = os.environ.get("SIRIUS_BENCH_EXTRA_SQL")
+        if extra_sql:
+            _execute_multi(con, extra_sql)
     elif profile_path is not None:
         # DuckDB CPU profiling: emit a per-operator JSON profile for the next
         # query. 'detailed' mode includes the physical operator tree (with
@@ -537,6 +542,12 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
 
     if pin != "none":
         parts.append(emit_pin(qnum, source, data_source))
+
+    # A/B hook: extra SQL (e.g. "SET fuse_merge_pipelines = false;") injected into every
+    # query session, so engine settings can be benchmarked without a rebuild.
+    extra_sql = os.environ.get("SIRIUS_BENCH_EXTRA_SQL")
+    if extra_sql:
+        parts.append(extra_sql)
 
     parts.append("SET gpu_execution = true;")
     # Open the nsys capture range BEFORE the first (cold) iteration so the cold
