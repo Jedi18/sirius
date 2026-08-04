@@ -33,6 +33,10 @@
 //                                 | NULL prefix then valid suffix
 //   ParquetFlbaDecimalNullFixture | FIXED_LEN_BYTE_ARRAY decimal with nulls
 //                                 | (reader-side filter pushdown disabled)
+//   ParquetMultiFileNullFixture   | glob over files that disagree about nulls
+//                                 | (populated / wholly-null / partial / empty)
+//   ParquetMixedRepetitionFixture | glob mixing a zero-NULL file with a
+//                                 | NULL-bearing one for the same column
 //
 // The three parquet decimal widths are all covered: precision <= 9 -> INT32,
 // <= 18 -> INT64, > 18 -> FIXED_LEN_BYTE_ARRAY. Precision <= 4 is deliberately
@@ -190,6 +194,13 @@ struct ParquetFileGuard {
   std::string scan(const std::string& name) const
   {
     return "read_parquet(" + sql_literal(path(name)) + ")";
+  }
+
+  // Return a read_parquet(...) SQL expression over a glob of files in the
+  // fixture directory (e.g. "mf_*.parquet").
+  std::string scan_glob(const std::string& pattern) const
+  {
+    return "read_parquet('" + path(pattern) + "')";
   }
 
   // Assert one leaf column's repetition_type ('REQUIRED' / 'OPTIONAL').
@@ -836,6 +847,115 @@ class ParquetFlbaDecimalNullFixture : public sirius::test::GpuExecutionFixture {
   std::string scan_;
 };
 
+// ---------------------------------------------------------------------------
+// Fixture 7 — multi-file glob scan with per-file NULL divergence
+//
+// Every other fixture reads ONE file, so nothing exercises how validity is
+// stitched together ACROSS files. The coalescer bundles several small files
+// into a single data-batch split (bundling is only blocked by a mismatch in
+// hive-partition values or in the per-file filter-pushdown decision, neither of
+// which differs here), so these four files are concatenated within one split
+// and a per-file validity mix-up would surface as values from one file
+// inheriting another's null mask.
+//
+// The four files deliberately disagree about nulls:
+//
+//   mf_0  ids  1..10  fully populated
+//   mf_1  ids 11..20  wholly NULL in v and s
+//   mf_2  ids 21..30  partially NULL (even ids valid)
+//   mf_3  (no rows)   empty file -- exercises the fully-pruned-file path, which
+//                     has dedicated handling in the coalescer (an all-empty
+//                     source must still emit one split or the pipeline hangs)
+//
+// Column types are declared on a table and reused per file so all four share an
+// identical schema; unifying files with DIFFERENT schemas would need
+// union_by_name, which Sirius does not implement.
+// ---------------------------------------------------------------------------
+
+class ParquetMultiFileNullFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  ParquetMultiFileNullFixture()
+  {
+    pq_.write({
+      "CREATE TABLE mf (id INTEGER, v INTEGER, s VARCHAR)",
+
+      // mf_0 -- fully populated.
+      "INSERT INTO mf SELECT i, i * 10, 'a' || CAST(i AS VARCHAR) FROM range(1, 11) AS t(i)",
+      "COPY mf TO '" + pq_.path("mf_0.parquet") + "' (FORMAT PARQUET)",
+      "DELETE FROM mf",
+
+      // mf_1 -- wholly NULL in both nullable columns.
+      "INSERT INTO mf SELECT i, NULL, NULL FROM range(11, 21) AS t(i)",
+      "COPY mf TO '" + pq_.path("mf_1.parquet") + "' (FORMAT PARQUET)",
+      "DELETE FROM mf",
+
+      // mf_2 -- partially NULL (valid on even ids).
+      "INSERT INTO mf SELECT i,"
+      "  CASE WHEN i % 2 = 0 THEN i * 10 END,"
+      "  CASE WHEN i % 2 = 0 THEN 'c' || CAST(i AS VARCHAR) END"
+      "  FROM range(21, 31) AS t(i)",
+      "COPY mf TO '" + pq_.path("mf_2.parquet") + "' (FORMAT PARQUET)",
+      "DELETE FROM mf",
+
+      // mf_3 -- empty (table is empty after the DELETE above).
+      "COPY mf TO '" + pq_.path("mf_3.parquet") + "' (FORMAT PARQUET)",
+    });
+
+    scan_ = pq_.scan_glob("mf_*.parquet");
+  }
+
+ protected:
+  ParquetFileGuard pq_{"multifile"};
+  std::string scan_;
+};
+
+// ---------------------------------------------------------------------------
+// Fixture 8 — a zero-NULL file globbed with a NULL-bearing one
+//
+// Unification must leave the dense file's rows all valid while preserving the
+// other file's NULLs. Getting it wrong is silent in either direction: the NULLs
+// vanish, or the dense file's rows are wrongly masked. The COUNT below pins
+// both.
+//
+// This does NOT mix REQUIRED and OPTIONAL repetition, which would be the
+// sharper test: DuckDB writes every top-level column OPTIONAL regardless of
+// NOT NULL constraints (ParquetWriter defaults can_have_nulls to true), so a
+// REQUIRED column needs a fixture from an external writer. Both files here are
+// OPTIONAL; only their null content differs. The repetition types are asserted
+// so this stays an accurate statement of what is covered.
+// ---------------------------------------------------------------------------
+
+class ParquetMixedRepetitionFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  ParquetMixedRepetitionFixture()
+  {
+    auto const req_path = pq_.path("mix_0.parquet");
+    auto const opt_path = pq_.path("mix_1.parquet");
+
+    pq_.write({
+      // Dense: no NULLs anywhere.
+      "CREATE TABLE dense_side (id INTEGER, v INTEGER)",
+      "INSERT INTO dense_side SELECT i, i * 10 FROM range(1, 11) AS t(i)",
+      "COPY dense_side TO '" + req_path + "' (FORMAT PARQUET)",
+
+      // Half NULL.
+      "CREATE TABLE null_side (id INTEGER, v INTEGER)",
+      "INSERT INTO null_side SELECT i, CASE WHEN i % 2 = 0 THEN i * 10 END"
+      "  FROM range(11, 21) AS t(i)",
+      "COPY null_side TO '" + opt_path + "' (FORMAT PARQUET)",
+    });
+
+    pq_.assert_repetition_type(req_path, "v", "OPTIONAL");
+    pq_.assert_repetition_type(opt_path, "v", "OPTIONAL");
+
+    scan_ = pq_.scan_glob("mix_*.parquet");
+  }
+
+ protected:
+  ParquetFileGuard pq_{"mixrep"};
+  std::string scan_;
+};
+
 }  // namespace
 
 // ===========================================================================
@@ -1179,4 +1299,104 @@ TEST_CASE_METHOD(ParquetFlbaDecimalNullFixture,
 {
   compare_gpu_vs_cpu("SELECT big_dec FROM " + scan_);
   compare_gpu_vs_cpu("SELECT n_big_dec FROM " + scan_);
+}
+
+// ===========================================================================
+// Tests: multi-file glob scans with per-file NULL divergence
+// ===========================================================================
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — NULL counts aggregate correctly across files",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // 30 rows total: mf_0 contributes 10 valid, mf_1 contributes 10 NULL, mf_2
+  // contributes 5 valid / 5 NULL, mf_3 contributes nothing.
+  // => COUNT(*) = 30, COUNT(v) = COUNT(s) = 15.
+  compare_gpu_vs_cpu("SELECT COUNT(*), COUNT(v), COUNT(s) FROM " + scan_);
+  compare_gpu_vs_cpu("SELECT SUM(v), MIN(v), MAX(v) FROM " + scan_);
+  compare_gpu_vs_cpu("SELECT MIN(s), MAX(s) FROM " + scan_);
+}
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — per-row validity is preserved across file boundaries",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // Ordered so a validity mask leaking from one file into the next shows up as
+  // a value/NULL landing on the wrong id rather than being sorted away.
+  compare_gpu_vs_cpu_ordered("SELECT id, v, s FROM " + scan_ + " ORDER BY id");
+}
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — IS NULL / IS NOT NULL spanning files",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // The IS NULL set must be exactly mf_1's ids (11..20) plus mf_2's odd ids.
+  compare_gpu_vs_cpu_ordered("SELECT id FROM " + scan_ + " WHERE v IS NULL ORDER BY id");
+  compare_gpu_vs_cpu_ordered("SELECT id FROM " + scan_ + " WHERE v IS NOT NULL ORDER BY id");
+  compare_gpu_vs_cpu_ordered("SELECT id FROM " + scan_ + " WHERE s IS NULL ORDER BY id");
+}
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — column-pruned multi-file scan of a mixed-null column",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // No id column to anchor the rows: a column-pruning bug in the multi-file
+  // path shows up only when the nullable column is projected alone.
+  compare_gpu_vs_cpu("SELECT v FROM " + scan_);
+  compare_gpu_vs_cpu("SELECT s FROM " + scan_);
+}
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — filter that prunes whole files",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // Selects rows only from mf_0, so mf_1/mf_2/mf_3 contribute nothing --
+  // exercising per-file pruning alongside the empty-file split path.
+  compare_gpu_vs_cpu_ordered("SELECT id, v FROM " + scan_ + " WHERE id <= 10 ORDER BY id");
+  // Matches nothing anywhere: every file prunes away, which must still produce
+  // an empty result rather than hanging or erroring.
+  compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan_ + " WHERE id > 1000");
+  compare_gpu_vs_cpu("SELECT id, v FROM " + scan_ + " WHERE id > 1000");
+}
+
+TEST_CASE_METHOD(ParquetMultiFileNullFixture,
+                 "parquet nulls — GROUP BY over a multi-file mixed-null column",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // The NULL group draws rows from two different files (mf_1 wholly, mf_2
+  // partially) and must be a single group.
+  compare_gpu_vs_cpu("SELECT v IS NULL AS is_null, COUNT(*) FROM " + scan_ + " GROUP BY v IS NULL");
+  compare_gpu_vs_cpu("SELECT s, COUNT(*) FROM " + scan_ + " GROUP BY s");
+}
+
+// ===========================================================================
+// Tests: zero-NULL file globbed with a NULL-bearing file
+// ===========================================================================
+
+TEST_CASE_METHOD(ParquetMixedRepetitionFixture,
+                 "parquet nulls — dense and NULL-bearing files unify into a nullable column",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  // 20 rows: the dense file's 10 are all valid, the other file's 10 are half
+  // NULL => COUNT(v) = 15. Masking the dense file's rows drops it to 5; losing
+  // the NULL-bearing file's mask raises it to 20.
+  compare_gpu_vs_cpu("SELECT COUNT(*), COUNT(v) FROM " + scan_);
+  compare_gpu_vs_cpu("SELECT SUM(v), MIN(v), MAX(v) FROM " + scan_);
+}
+
+TEST_CASE_METHOD(ParquetMixedRepetitionFixture,
+                 "parquet nulls — per-row values across dense and NULL-bearing files",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  compare_gpu_vs_cpu_ordered("SELECT id, v FROM " + scan_ + " ORDER BY id");
+  // NULLs may only come from the NULL-bearing file (ids 11..20, odd).
+  compare_gpu_vs_cpu_ordered("SELECT id FROM " + scan_ + " WHERE v IS NULL ORDER BY id");
+  compare_gpu_vs_cpu_ordered("SELECT id FROM " + scan_ + " WHERE v IS NOT NULL ORDER BY id");
+}
+
+TEST_CASE_METHOD(ParquetMixedRepetitionFixture,
+                 "parquet nulls — column-pruned scan across dense and NULL-bearing files",
+                 "[integration][gpu_execution][scan][nulls][parquet][multifile]")
+{
+  compare_gpu_vs_cpu("SELECT v FROM " + scan_);
 }
