@@ -38,6 +38,11 @@
 //   ParquetMixedRepetitionFixture | glob mixing a zero-NULL file with a
 //                                 | NULL-bearing one for the same column
 //
+// Two questions are asked of each shape: is a NULL still a NULL after decoding
+// (most of the file), and does a decoded NULL sort where SQL says it should
+// (the ORDER BY section at the end, ported from the native-scan equivalent in
+// test_gpu_execution_order_nulls.cpp).
+//
 // The three parquet decimal widths are all covered: precision <= 9 -> INT32,
 // <= 18 -> INT64, > 18 -> FIXED_LEN_BYTE_ARRAY. Precision <= 4 is deliberately
 // avoided -- DuckDB stores it as INT16 and Sirius throws for that case
@@ -1414,4 +1419,109 @@ TEST_CASE_METHOD(ParquetMixedRepetitionFixture,
                  "[integration][gpu_execution][scan][nulls][parquet][multifile]")
 {
   compare_gpu_vs_cpu("SELECT v FROM " + scan_);
+}
+
+// ===========================================================================
+// Tests: NULL placement under ORDER BY
+// ===========================================================================
+//
+// Everything above tests whether a NULL is *present* after decoding. Ordering
+// tests something different: that a decoded NULL sorts where SQL says it
+// should. test_gpu_execution_order_nulls.cpp covers this for the DuckDB-native
+// scan; these run the same four cases over parquet-decoded validity.
+//
+// Every query carries `, id ASC` as a tie-break. The NULL rows all share the
+// same sort key, so without it their relative order is unspecified and the
+// ordered comparison would be comparing noise.
+
+namespace {
+
+struct null_order_case {
+  char const* direction;  ///< ASC or DESC
+  char const* position;   ///< FIRST or LAST
+};
+
+constexpr null_order_case kNullOrderCases[] = {
+  {"ASC", "FIRST"},
+  {"ASC", "LAST"},
+  {"DESC", "FIRST"},
+  {"DESC", "LAST"},
+};
+
+std::string order_case_name(null_order_case const& c)
+{
+  return std::string(c.direction) + " NULLS " + c.position;
+}
+
+}  // namespace
+
+// One partially-NULL column per physical encoding, so a placement bug that only
+// affects (say) the BYTE_ARRAY or DECIMAL decode path is not hidden by INTEGER
+// happening to work.
+TEST_CASE_METHOD(ParquetNullFixture,
+                 "parquet nulls — ORDER BY places decoded NULLs correctly",
+                 "[integration][gpu_execution][scan][nulls][parquet][order_by]")
+{
+  for (auto const* column : {"p_int", "p_big", "p_dbl", "p_dec32", "p_dec64", "p_date", "p_ts",
+                             "p_str", "p_bool"}) {
+    for (auto const& order_case : kNullOrderCases) {
+      DYNAMIC_SECTION(std::string(column) + " " + order_case_name(order_case))
+      {
+        compare_gpu_vs_cpu_ordered("SELECT id, " + std::string(column) + " FROM " + scan_ +
+                                   " ORDER BY " + column + " " + order_case.direction +
+                                   " NULLS " + order_case.position + ", id ASC");
+      }
+    }
+  }
+}
+
+// Wholly-NULL columns are the degenerate case: every row ties on the sort key,
+// so the tie-break alone determines the output and NULLS FIRST/LAST must not
+// change it.
+TEST_CASE_METHOD(ParquetNullFixture,
+                 "parquet nulls — ORDER BY on a wholly-NULL column",
+                 "[integration][gpu_execution][scan][nulls][parquet][order_by]")
+{
+  for (auto const& order_case : kNullOrderCases) {
+    DYNAMIC_SECTION(order_case_name(order_case))
+    {
+      compare_gpu_vs_cpu_ordered("SELECT id, n_int FROM " + scan_ + " ORDER BY n_int " +
+                                 order_case.direction + " NULLS " + order_case.position +
+                                 ", id ASC");
+    }
+  }
+}
+
+// TOP-N is a separate operator from a full sort, and the LIMIT boundary is
+// exactly where a misplaced NULL changes which rows survive.
+TEST_CASE_METHOD(ParquetNullFixture,
+                 "parquet nulls — TOP-N places decoded NULLs correctly",
+                 "[integration][gpu_execution][scan][nulls][parquet][order_by][top_n]")
+{
+  for (auto const& order_case : kNullOrderCases) {
+    DYNAMIC_SECTION(order_case_name(order_case))
+    {
+      // 6 of 16 rows, so the cut falls inside the NULL run for FIRST and inside
+      // the valid run for LAST.
+      compare_gpu_vs_cpu_ordered("SELECT id, p_int FROM " + scan_ + " ORDER BY p_int " +
+                                 order_case.direction + " NULLS " + order_case.position +
+                                 ", id ASC LIMIT 6");
+    }
+  }
+}
+
+// A larger input, so the sort sees NULLs spread across several row groups
+// rather than a single decoded batch.
+TEST_CASE_METHOD(ParquetMultiRowGroupFixture,
+                 "parquet nulls — ORDER BY over NULLs spanning row groups",
+                 "[integration][gpu_execution][scan][nulls][parquet][order_by]")
+{
+  for (auto const& order_case : kNullOrderCases) {
+    DYNAMIC_SECTION(order_case_name(order_case))
+    {
+      compare_gpu_vs_cpu_ordered("SELECT id, part FROM " + scan_ + " ORDER BY part " +
+                                 order_case.direction + " NULLS " + order_case.position +
+                                 ", id ASC LIMIT 100");
+    }
+  }
 }
