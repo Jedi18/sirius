@@ -200,7 +200,7 @@ struct ParquetFileGuard {
   // fixture directory (e.g. "mf_*.parquet").
   std::string scan_glob(const std::string& pattern) const
   {
-    return "read_parquet('" + path(pattern) + "')";
+    return "read_parquet(" + sql_literal(path(pattern)) + ")";
   }
 
   // Assert one leaf column's repetition_type ('REQUIRED' / 'OPTIONAL').
@@ -881,12 +881,12 @@ class ParquetMultiFileNullFixture : public sirius::test::GpuExecutionFixture {
 
       // mf_0 -- fully populated.
       "INSERT INTO mf SELECT i, i * 10, 'a' || CAST(i AS VARCHAR) FROM range(1, 11) AS t(i)",
-      "COPY mf TO '" + pq_.path("mf_0.parquet") + "' (FORMAT PARQUET)",
+      "COPY mf TO " + pq_.sql_literal(pq_.path("mf_0.parquet")) + " (FORMAT PARQUET)",
       "DELETE FROM mf",
 
       // mf_1 -- wholly NULL in both nullable columns.
       "INSERT INTO mf SELECT i, NULL, NULL FROM range(11, 21) AS t(i)",
-      "COPY mf TO '" + pq_.path("mf_1.parquet") + "' (FORMAT PARQUET)",
+      "COPY mf TO " + pq_.sql_literal(pq_.path("mf_1.parquet")) + " (FORMAT PARQUET)",
       "DELETE FROM mf",
 
       // mf_2 -- partially NULL (valid on even ids).
@@ -894,12 +894,23 @@ class ParquetMultiFileNullFixture : public sirius::test::GpuExecutionFixture {
       "  CASE WHEN i % 2 = 0 THEN i * 10 END,"
       "  CASE WHEN i % 2 = 0 THEN 'c' || CAST(i AS VARCHAR) END"
       "  FROM range(21, 31) AS t(i)",
-      "COPY mf TO '" + pq_.path("mf_2.parquet") + "' (FORMAT PARQUET)",
+      "COPY mf TO " + pq_.sql_literal(pq_.path("mf_2.parquet")) + " (FORMAT PARQUET)",
       "DELETE FROM mf",
 
       // mf_3 -- empty (table is empty after the DELETE above).
-      "COPY mf TO '" + pq_.path("mf_3.parquet") + "' (FORMAT PARQUET)",
+      "COPY mf TO " + pq_.sql_literal(pq_.path("mf_3.parquet")) + " (FORMAT PARQUET)",
     });
+
+    // Each file's NULL population, since the whole fixture is about the files
+    // DISAGREEING -- a generation slip that made them agree would leave every
+    // assertion below passing while testing nothing. mf_3 is skipped: it has no
+    // row groups, so there are no statistics to read.
+    pq_.assert_null_population(pq_.path("mf_0.parquet"), "v", /*nulls=*/0, /*rows=*/10);
+    pq_.assert_null_population(pq_.path("mf_0.parquet"), "s", /*nulls=*/0, /*rows=*/10);
+    pq_.assert_null_population(pq_.path("mf_1.parquet"), "v", /*nulls=*/10, /*rows=*/10);
+    pq_.assert_null_population(pq_.path("mf_1.parquet"), "s", /*nulls=*/10, /*rows=*/10);
+    pq_.assert_null_population(pq_.path("mf_2.parquet"), "v", /*nulls=*/5, /*rows=*/10);
+    pq_.assert_null_population(pq_.path("mf_2.parquet"), "s", /*nulls=*/5, /*rows=*/10);
 
     scan_ = pq_.scan_glob("mf_*.parquet");
   }
@@ -936,17 +947,21 @@ class ParquetMixedRepetitionFixture : public sirius::test::GpuExecutionFixture {
       // Dense: no NULLs anywhere.
       "CREATE TABLE dense_side (id INTEGER, v INTEGER)",
       "INSERT INTO dense_side SELECT i, i * 10 FROM range(1, 11) AS t(i)",
-      "COPY dense_side TO '" + req_path + "' (FORMAT PARQUET)",
+      "COPY dense_side TO " + pq_.sql_literal(req_path) + " (FORMAT PARQUET)",
 
       // Half NULL.
       "CREATE TABLE null_side (id INTEGER, v INTEGER)",
       "INSERT INTO null_side SELECT i, CASE WHEN i % 2 = 0 THEN i * 10 END"
       "  FROM range(11, 21) AS t(i)",
-      "COPY null_side TO '" + opt_path + "' (FORMAT PARQUET)",
+      "COPY null_side TO " + pq_.sql_literal(opt_path) + " (FORMAT PARQUET)",
     });
 
     pq_.assert_repetition_type(req_path, "v", "OPTIONAL");
     pq_.assert_repetition_type(opt_path, "v", "OPTIONAL");
+    // The COUNT(v) == 15 the tests below rely on only means something if one
+    // file really has no NULLs and the other exactly half.
+    pq_.assert_null_population(req_path, "v", /*nulls=*/0, /*rows=*/10);
+    pq_.assert_null_population(opt_path, "v", /*nulls=*/5, /*rows=*/10);
 
     scan_ = pq_.scan_glob("mix_*.parquet");
   }
