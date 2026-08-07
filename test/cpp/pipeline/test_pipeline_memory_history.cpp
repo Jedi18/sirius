@@ -140,4 +140,70 @@ TEST_CASE("pipeline_memory_history is thread-safe for concurrent recording",
   auto estimate = history.estimate_peak_memory(200);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate > 0);
+
+  // Every record is counted in the running totals, unlike the capped ring buffer.
+  REQUIRE(history.totals().records ==
+          static_cast<std::size_t>(num_threads) * static_cast<std::size_t>(records_per_thread));
+}
+
+TEST_CASE("pipeline_memory_history has no output/input ratio without records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+  REQUIRE_FALSE(history.output_to_input_ratio().has_value());
+  REQUIRE(history.total_output_bytes() == 0);
+}
+
+TEST_CASE("pipeline_memory_history aggregates the output/input ratio over all records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 60});
+  history.record({300, 600, 140});
+
+  // Aggregate, not per-record: 200 out of 400 in.
+  auto ratio = history.output_to_input_ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+
+  REQUIRE(history.total_output_bytes() == 200);
+  REQUIRE(history.totals().input_basis_bytes == 400);
+  REQUIRE(history.totals().records == 2);
+}
+
+TEST_CASE("pipeline_memory_history totals survive ring-buffer eviction",
+          "[pipeline_memory_history][ratio][ring_buffer]")
+{
+  pipeline_memory_history history;
+
+  // 200 records is well past the 64-entry ring, so a totals implementation backed by the ring
+  // would lose most of this.
+  for (std::size_t i = 0; i < 200; ++i) {
+    history.record({100, 200, 25});
+  }
+
+  REQUIRE(history.size() == 64);
+  REQUIRE(history.totals().records == 200);
+  REQUIRE(history.total_output_bytes() == std::size_t{200} * 25);
+
+  auto ratio = history.output_to_input_ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.25));
+}
+
+TEST_CASE("pipeline_memory_history excludes failed tasks from the output/input ratio",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 50});
+  // A task that OOM'd produced no output; counting its input would drag the ratio down.
+  history.record_on_failure(400, 900);
+
+  auto ratio = history.output_to_input_ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+  REQUIRE(history.totals().records == 1);
+  REQUIRE(history.totals().input_basis_bytes == 100);
 }
