@@ -356,6 +356,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/data_size_estimator.cpp
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp

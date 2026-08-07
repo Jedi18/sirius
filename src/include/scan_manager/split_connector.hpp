@@ -79,6 +79,19 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
   [[nodiscard]] bool has_more_splits() const;
 
+  /// \brief True once close() has been called, regardless of whether the queue has drained.
+  ///
+  /// Distinct from @ref is_closed (closed AND drained): this reports that split *discovery*
+  /// is finished, i.e. @ref discovered_bytes is now the complete total for the scan. Read by
+  /// sirius_gpu_scan_operator::total_source_input_bytes().
+  [[nodiscard]] bool is_discovery_complete() const;
+
+  /// \brief Sum of `get_estimated_size_in_bytes()` over every split pushed so far.
+  ///
+  /// Monotonic — unaffected by consumers draining the queue. Complete once
+  /// @ref is_discovery_complete returns true; a lower bound before that.
+  [[nodiscard]] std::size_t discovered_bytes() const;
+
  private:
   friend class load_balancing_scan_batch_coalescer;
 
@@ -92,6 +105,9 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
   std::exception_ptr _exception;
+  /// Monotonic discovery total: accumulated in push_split, never decremented when a
+  /// consumer pops. See @ref discovered_bytes.
+  std::size_t _discovered_bytes{0};
 };
 
 }  // namespace sirius::scan_manager

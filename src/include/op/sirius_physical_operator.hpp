@@ -537,6 +537,46 @@ class sirius_physical_operator {
     return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
+  // Hooks for the data size estimator (`pipeline/data_size_estimator.hpp`). All four default to
+  // nullopt, meaning "this operator cannot answer", which makes the estimator report no estimate
+  // — the correct outcome for STREAMING_SOURCE, CTE and delim-join wiring. See
+  // docs/super-sirius/data-size-estimation.md.
+
+  /// Total bytes this leaf source will feed its pipeline over the whole query, in the same units
+  /// as `pipeline_memory_history::input_basis`, so the estimator may scale it by the pipeline's
+  /// learned input->output ratio.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// Total bytes this leaf source will *emit*, consulted only when @ref total_source_input_bytes
+  /// is nullopt. Already an output quantity, so the estimator does NOT apply the pipeline ratio:
+  /// that ratio's denominator is pre-filter, and scaling a post-filter figure by it would count
+  /// filter selectivity twice.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_output_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// For a fan-in operator, the port carrying the volume-driving input — a hash join nominates
+  /// its probe port, since the build side is consumed once into a hash table. Tells the
+  /// estimator which upstream to follow. Must be paired with @ref consumed_primary_input_bytes.
+  [[nodiscard]] virtual std::optional<std::string_view> primary_input_port() const
+  {
+    return std::nullopt;
+  }
+
+  /// Bytes *processed* from @ref primary_input_port, counted once per distinct batch. Both
+  /// halves are load-bearing: count on first entry into a task, not on arrival in the port, or
+  /// the ratio reads far too low while input is still streaming; and once per batch, because a
+  /// STANDARD join re-pairs each probe batch against every build batch, which is exactly why
+  /// `input_basis` cannot serve here (its sum is a cross product, not an input volume).
+  [[nodiscard]] virtual std::optional<std::size_t> consumed_primary_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
  public:
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);

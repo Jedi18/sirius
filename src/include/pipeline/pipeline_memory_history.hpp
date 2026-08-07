@@ -39,11 +39,27 @@ struct task_memory_record {
 };
 
 /**
+ * @brief Running totals across every successful task a pipeline has completed.
+ *
+ * Unlike the ring buffer these are monotonic and never evicted, so they stay
+ * accurate for pipelines that run more than kMaxRecords tasks. Used by the
+ * data size estimator to derive a pipeline's aggregate input->output ratio.
+ */
+struct history_totals {
+  std::size_t input_basis_bytes = 0;  ///< Sum of estimated_bytes over successful tasks
+  std::size_t output_bytes      = 0;  ///< Sum of output_bytes over successful tasks
+  std::size_t records           = 0;  ///< Number of successful tasks contributing above
+};
+
+/**
  * @brief Thread-safe collection of memory records for a single pipeline.
  *
  * Stores a bounded ring buffer of recent task_memory_records and provides
  * an estimation function that uses historical ratios to predict peak memory
  * consumption for a new task given its estimation basis.
+ *
+ * Separately maintains unbounded @ref history_totals so the pipeline's
+ * aggregate input->output ratio survives ring-buffer eviction.
  */
 class pipeline_memory_history {
  public:
@@ -65,6 +81,13 @@ class pipeline_memory_history {
     } else {
       _records[_write_pos] = rec;
       _write_pos           = (_write_pos + 1) % kMaxRecords;
+    }
+    // Only tasks that produced output contribute to the input->output ratio; a
+    // failed (OOM'd) task carries no output_bytes and would bias the ratio down.
+    if (rec.output_bytes.has_value()) {
+      _totals.input_basis_bytes += rec.estimated_bytes;
+      _totals.output_bytes += *rec.output_bytes;
+      _totals.records++;
     }
   }
 
@@ -153,12 +176,52 @@ class pipeline_memory_history {
     return _records.size();
   }
 
+  /**
+   * @brief Unbounded running totals over every successful task (see @ref history_totals).
+   */
+  [[nodiscard]] history_totals totals() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _totals;
+  }
+
+  /**
+   * @brief Total bytes this pipeline has emitted so far.
+   *
+   * For a finished pipeline this is its complete output size.
+   */
+  [[nodiscard]] std::size_t total_output_bytes() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _totals.output_bytes;
+  }
+
+  /**
+   * @brief Aggregate output/input ratio across every successful task.
+   *
+   * The multiplier the data size estimator chains when projecting how much data
+   * a downstream port will ultimately receive. Deliberately an aggregate rather
+   * than the proximity-weighted scheme estimate_peak_memory() uses: we are
+   * projecting a total, not sizing one task.
+   *
+   * @return nullopt when no successful task has been recorded yet (no basis for
+   *         a ratio), which the estimator surfaces to its caller.
+   */
+  [[nodiscard]] std::optional<double> output_to_input_ratio() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_totals.records == 0 || _totals.input_basis_bytes == 0) { return std::nullopt; }
+    return static_cast<double>(_totals.output_bytes) /
+           static_cast<double>(_totals.input_basis_bytes);
+  }
+
  private:
   static constexpr std::size_t kMaxRecords = 64;
 
   mutable std::mutex _mutex;
   std::vector<task_memory_record> _records;
   std::size_t _write_pos = 0;
+  history_totals _totals;
 };
 
 }  // namespace sirius::pipeline

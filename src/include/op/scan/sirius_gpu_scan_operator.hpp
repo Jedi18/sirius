@@ -25,7 +25,9 @@
 #include <cudf/types.hpp>
 
 // standard library
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -129,6 +131,32 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     const op::input_stats& stats) noexcept;
 
   /**
+   * @brief Total decoded bytes this scan will feed its pipeline, once every split is known.
+   *
+   * Sums `scan_info::estimated_bytes()` across every split the scan manager pushed into this
+   * operator's connector — the same quantity `pipeline_memory_history` records as a scan
+   * task's `input_basis`, so the estimator can scale it by the pipeline's learned ratio.
+   *
+   * Returns nullopt until split discovery has closed. There is no useful partial answer: the
+   * split provider claims every metadata unit up front and reads footers asynchronously, so a
+   * claim-based progress fraction saturates immediately and would extrapolate a near-zero
+   * total. Callers fall back to @ref total_source_output_bytes in the meantime.
+   */
+  [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
+
+  /**
+   * @brief Planner-cardinality estimate of the scan's total output, available early.
+   *
+   * `estimated_cardinality * (bytes emitted / rows emitted)`, using the running per-batch
+   * counters this operator accumulates in @ref execute. Both factors are post-filter, so the
+   * result is directly comparable to downstream output bytes and must NOT be scaled by the
+   * pipeline's input->output ratio (which already encodes filter selectivity).
+   *
+   * Returns nullopt until at least one batch with rows has been emitted.
+   */
+  [[nodiscard]] std::optional<std::size_t> total_source_output_bytes() const override;
+
+  /**
    * @brief Returns the complete carrier schema used to normalize scan output
    *
    * Selects the explicit physical schema when present and the native cuDF schema otherwise.
@@ -154,6 +182,18 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   duckdb::SiriusContext* _compressed_materialization_observer;
   /// Native cuDF carrier for each logical output column, in output order.
   std::vector<cudf::data_type> _native_physical_types;
+  /// Running post-filter output totals, accumulated per batch in execute() on the executor
+  /// threads and read by total_source_output_bytes().
+  ///
+  /// The two numbers are only meaningful as a pair — their quotient is the bytes-per-row factor
+  /// the estimator extrapolates from — so they are published together under _emitted_mutex
+  /// rather than as two independent atomics. Two separate stores would let a reader divide a
+  /// row count by a byte total that does not include those rows, and a batch whose byte size
+  /// could not be read would leave rows permanently ahead of bytes, biasing every later
+  /// estimate low. A batch that yields no size contributes neither number.
+  mutable std::mutex _emitted_mutex;
+  std::size_t _emitted_bytes{0};
+  std::size_t _emitted_rows{0};
 };
 
 }  // namespace sirius::op::scan

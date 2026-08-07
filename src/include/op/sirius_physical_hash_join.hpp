@@ -365,7 +365,30 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /// The probe side: probe volume drives this join's output volume, while the build is consumed
+  /// once into a hash table. See sirius_physical_operator::primary_input_port.
+  [[nodiscard]] std::optional<std::string_view> primary_input_port() const override
+  {
+    return std::string_view{"default"};
+  }
+
+  /// Probe bytes processed so far — withheld until the build side is whole. Output per probe
+  /// byte climbs while build batches arrive (a probe batch paired against 1 of an eventual 5
+  /// build batches has emitted a fifth of what it finally will), so any ratio sampled during
+  /// that window reads several times too low.
+  [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override
+  {
+    if (!_build_side_complete.load(std::memory_order_relaxed)) { return std::nullopt; }
+    return _consumed_probe_bytes.load(std::memory_order_relaxed);
+  }
+
  protected:
+  /// Add @p batch's bytes to @ref _consumed_probe_bytes. Call exactly once per distinct probe
+  /// batch, at the point it first *enters a task* rather than when it arrives in the port — the
+  /// pop in BUILD_PROBE, and the first pairing on the STANDARD/MIXED cross schedule. Build bytes
+  /// are never counted. Null batches are ignored.
+  void note_probe_bytes(const std::shared_ptr<cucascade::data_batch>& batch);
+
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
 
@@ -395,6 +418,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
   // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
+
+  // Probe bytes taken so far, once per distinct batch (see note_probe_bytes). Relaxed ordering:
+  // the derived value is an estimate and readers tolerate a slightly stale count.
+  std::atomic<std::size_t> _consumed_probe_bytes{0};
+
+  // True once the build port's producing pipeline has finished, so no further build batch can
+  // arrive. Latched in get_next_task_input_data under op_state_mutex; only goes false -> true.
+  std::atomic<bool> _build_side_complete{false};
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

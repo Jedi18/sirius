@@ -118,6 +118,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <unordered_map>
@@ -2096,6 +2097,41 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
+/// Upper bound on size_estimate_safety_factor. The factor multiplies a projected byte total that
+/// is then narrowed to uint64_t; anything beyond this is a typo rather than a tuning choice, and
+/// large values only ever inflate the partition count.
+static constexpr double kMaxSizeEstimateSafetyFactor = 1000.0;
+
+static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                              = lock_operator_params_slot(context);
+  params->enable_runtime_size_estimation = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_SIZE_ESTIMATION to {}",
+                   params->enable_runtime_size_estimation);
+}
+
+static void SetSizeEstimateSafetyFactor(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot           = lock_operator_params_slot(context);
+  const double factor = parameter.GetValue<double>();
+  // Reject non-finite and absurd multipliers here rather than downstream: the value scales a
+  // projected byte total that is then cast to uint64_t, so a NaN/inf or a wildly large factor
+  // would turn into an undefined or nonsensical partition count.
+  if (!std::isfinite(factor) || factor <= 0.0 || factor > kMaxSizeEstimateSafetyFactor) {
+    throw InvalidInputException(
+      "size_estimate_safety_factor must be finite and in (0.0, %g], got %f",
+      kMaxSizeEstimateSafetyFactor,
+      factor);
+  }
+  params->size_estimate_safety_factor = factor;
+  SIRIUS_LOG_DEBUG("Updated config SIZE_ESTIMATE_SAFETY_FACTOR to {}",
+                   params->size_estimate_safety_factor);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator_params& defaults)
 {
   // Add in config option for gpu buffer manager
@@ -2390,6 +2426,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     LogicalType::BOOLEAN,
     Value::BOOLEAN(defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "enable_runtime_size_estimation",
+    "Let a grouped aggregation's PARTITION size itself from a projected input total instead of "
+    "waiting for its whole input, turning that hard barrier into a partial one. Off by default",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(defaults.enable_runtime_size_estimation),
+    SetEnableRuntimeSizeEstimation);
+
+  config.AddExtensionOption(
+    "size_estimate_safety_factor",
+    "Multiplier applied to a projected data size before it is used to size partitions; raise "
+    "above 1.0 to bias toward more (smaller) partitions when projections undershoot. Measured "
+    "totals are used as-is",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(defaults.size_estimate_safety_factor),
+    SetSizeEstimateSafetyFactor);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

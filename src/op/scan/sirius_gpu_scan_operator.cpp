@@ -43,8 +43,10 @@
 
 // standard library
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -191,6 +193,28 @@ std::optional<task_creation_hint> sirius_gpu_scan_operator::get_next_task_hint()
 
 bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_input_bytes() const
+{
+  if (!_split_connector->is_discovery_complete()) { return std::nullopt; }
+  return _split_connector->discovered_bytes();
+}
+
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_output_bytes() const
+{
+  std::size_t rows  = 0;
+  std::size_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    rows  = _emitted_rows;
+    bytes = _emitted_bytes;
+  }
+  if (rows == 0 || bytes == 0) { return std::nullopt; }
+  auto const bytes_per_row = static_cast<double>(bytes) / static_cast<double>(rows);
+  auto const projected     = static_cast<double>(estimated_cardinality) * bytes_per_row;
+  if (!std::isfinite(projected) || projected < 0.0) { return std::nullopt; }
+  return static_cast<std::size_t>(projected);
+}
+
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
   auto next = _split_connector->get_next_split();
@@ -246,8 +270,24 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                              stream,
                                              mem_space->get_default_allocator());
   }
+
+  // Read the row count before the table is moved into the batch; its byte size is only
+  // available afterwards.
+  auto const emitted_rows = static_cast<std::size_t>(output_table->num_rows());
+
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+
+  // Feed the bytes-per-row factor behind total_source_output_bytes(). Rows and bytes are only
+  // meaningful as a pair, so publish them in one update — and publish nothing at all if this
+  // batch's size could not be read, rather than leaving rows ahead of bytes for the rest of the
+  // query.
+  if (auto ro = batch->to_read_only(); ro.get_data()) {
+    auto const emitted_bytes = ro.get_data()->get_size_in_bytes();
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    _emitted_rows += emitted_rows;
+    _emitted_bytes += emitted_bytes;
+  }
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
