@@ -37,6 +37,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
+| [Data Size Estimation](data-size-estimation.md) | Runtime projection of data volume; the partial-barrier group-by partition |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
@@ -57,7 +58,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 8. **Scan** — how data enters the system from storage
 9. **Memory Management** — GPU memory tiers, reservations, spilling
 10. **Data Management** — data batch lifecycle and port wiring
-11. **Configuration** — tuning knobs and runtime settings
-12. **Optimizations** — performance improvements and their mechanisms
+11. **Data Size Estimation** — projecting how much data will arrive at an operator
+12. **Configuration** — tuning knobs and runtime settings
+13. **Optimizations** — performance improvements and their mechanisms
 
 <!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->

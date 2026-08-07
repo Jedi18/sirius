@@ -277,9 +277,10 @@ These operators are injected during pipeline splitting. They don't map to DuckDB
 Repartitions data into N buckets based on partition keys.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
-- **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
+- **Adaptive count:** the downstream consumer's `get_partition_strategy()` computes N from input data size and `hash_partition_bytes` (`natural_num_partitions()`). Fixed on the first task and never revised — later batches would otherwise land in slots computed under a different modulus.
 - **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
+- **Projected sizing (aggregate fanout):** the group-by partition sizes itself from a *projected* total rather than the bytes on hand, via `estimate_port_total_input_bytes()` (see [data management](data-management.md#runtime-data-size-estimation)). That is what lets its ingress be a `PARTIAL` barrier — `resolve_barrier` relaxes that edge only when `enable_runtime_size_estimation` is set on the partition, so with the setting off the ingress stays `FULL` as it always was. While the edge *is* relaxed, `get_next_task_hint()` withholds tasks until a projection is actually available, reproducing the `FULL` wait. On finalize the operator logs projected-vs-actual bytes at INFO so the projection's accuracy can be checked from a query log.
+- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`, `_size_estimate`
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
