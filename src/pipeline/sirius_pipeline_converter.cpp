@@ -216,8 +216,13 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
     return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
   }
   // Probe-side PARTITION under a join streams batches → PARTIAL; build-side PARTITION is
-  // FULL (build must accumulate every partition before the probe can join). Aggregate-
-  // fanout PARTITIONs are also FULL — the merge operator needs every per-thread bucket.
+  // FULL (build must accumulate every partition before the probe can join). An aggregate-
+  // fanout PARTITION is PARTIAL only when estimation is enabled on it, so feature-off keeps the
+  // original barrier rather than an emulation of it — and so does the delim-join DISTINCT
+  // partition, which sits under a grouped_aggregate_merge (likewise typed MERGE_GROUP_BY) but
+  // is never constructed with estimation enabled, and which the type test alone cannot tell
+  // apart. Only the producer→PARTITION edge is relaxed; PARTITION→MERGE_GROUP_BY is handled
+  // above and stays FULL, since the merge still needs every bucket.
   // Join-feeders sit under a CONCAT (wrap_join_child's wrap chain); aggregate-fanouts sit
   // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join sizes
   // from the complete probe input (CONCAT retains the whole probe partition), so its probe
@@ -227,6 +232,11 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
     auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
     auto* partition_parent = partition.get_parent_op();
     const bool join_feeder = partition_parent != nullptr && partition_parent->type == T::CONCAT;
+    const bool aggregate_fanout =
+      partition_parent != nullptr && partition_parent->type == T::MERGE_GROUP_BY;
+    if (aggregate_fanout && partition.is_size_estimation_enabled()) {
+      return op::MemoryBarrierType::PARTIAL;
+    }
     // Tree-parent walk: PARTITION -> CONCAT -> owning join (stamped at plan-gen).
     auto* join = join_feeder ? partition_parent->get_parent_op() : nullptr;
     const bool right_family_full =

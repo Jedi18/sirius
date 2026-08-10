@@ -95,6 +95,8 @@ sirius:
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    enable_runtime_size_estimation: false # project total port input from upstream in/out ratios (off by default)
+    size_estimate_safety_factor: 1.0      # pad a projected total before sizing partitions
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -368,7 +370,7 @@ batch default**. Each can still be overridden individually.
 | `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target batch size for DuckDB scan tasks |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
-| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys; must be greater than zero |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target output batch size for CONCAT operator |
 | `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
@@ -380,6 +382,8 @@ batch default**. Each can still be overridden individually.
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `enable_runtime_size_estimation` | false | Let operators project how many bytes will ultimately reach an input port by chaining upstream pipelines' measured input/output ratios. Lets a grouped aggregation's PARTITION fix its count from the first batch instead of its whole input, turning that hard barrier into a partial one. Off restores the previous wait-for-everything behavior. |
+| `size_estimate_safety_factor` | 1.0 | Multiplier applied to a *projected* total before it sizes partitions; raise above 1.0 to bias toward more (smaller) partitions when projections undershoot. Measured totals are used as-is. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -547,7 +551,7 @@ SET enable_compressed_materialization = false;
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
-| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Hash partition target size; must be greater than zero |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Hash partition target size |
 | `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | CONCAT output batch size |
 | `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
@@ -586,6 +590,43 @@ the setting enabled. Disabling it only for a query leaves existing statistics in
 
 ```sql
 SET enable_pinned_zone_map_pruning = false;
+```
+
+### Runtime Data Size Estimation
+
+Both settings are accepted as DuckDB `SET` variables and in YAML under
+`sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_runtime_size_estimation` | false | Project the total bytes that will reach an operator's input port by chaining upstream pipelines' measured input/output ratios back to the first finished pipeline (or a scan that knows its total). |
+| `size_estimate_safety_factor` | 1.0 | Multiplier applied to a projected total before it sizes partitions. Must be > 0. Measured totals are not scaled. |
+
+Today the sole consumer is the grouped aggregation's PARTITION: with a projection it fixes its
+partition count from the first batches, so its ingress runs as a `PARTIAL` rather than a `FULL`
+barrier and partitioning overlaps with the upstream aggregation. With the setting off (the
+default) that ingress is never relaxed in the first place — the pre-feature code path, not an
+emulation of it. With it on but no projection yet available, the operator withholds tasks until
+its producing pipeline finishes, which reproduces the same wait. See
+[Data Size Estimation](data-size-estimation.md), which also records what has and has not been
+measured.
+
+Each partition operator logs its projected-vs-actual total at INFO when it finalizes, which is
+how the projection's accuracy is checked after a query:
+
+```
+sirius_physical_partition id 7 size estimate: sized from projected 268435456 bytes
+(exact=false, hops=1, samples=12), actual 259788800 bytes, error +3.3%, partitions 4
+```
+
+`sized from` is the field that matters: `projected` means a prediction chose the count,
+`upstream-complete` means the producer had already finished (correct, but too late to relax
+anything), and `measured` means no projection was used at all. When the count was not chosen from
+a projection the line says so instead of reporting a meaningless error figure.
+
+```sql
+SET enable_runtime_size_estimation = true;   -- off by default
+SET size_estimate_safety_factor = 1.25;
 ```
 
 ### Transparent Execution

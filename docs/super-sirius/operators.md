@@ -152,7 +152,7 @@ Three execution modes:
 |------|-----------|----------|
 | `STANDARD` | Default, multi-partition Cartesian product | `cudf::inner_join()`, `cudf::left_join()`, etc. |
 | `BUILD_PROBE` | Up to one partition per GPU, per-partition build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once per partition, probed many times |
-| `MIXED_JOIN` | Equality plus either inequality conditions or a null-safe `IS NOT DISTINCT FROM` key (mixed with a plain `=`), on disjoint columns | `cudf::mixed_join()` with cuDF AST |
+| `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
 `update_join_exec_mode()` selects BUILD_PROBE when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU build side fits `max_build_hash_table_bytes` and folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. The pure eligibility gate is `build_probe_mode_eligible()`. For a broadcast join the **full** replicated build size is charged against `max_build_hash_table_bytes` (each GPU builds the entire table); a hash-partitioned build charges the per-partition average.
 
@@ -181,7 +181,7 @@ The following table summarizes, per join type, what concat folds, which side str
 | RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
 | SINGLE | — | — | — | — | — | unsupported (throws) |
 
-† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
+† MIXED_JOIN applies to any of these types when the join carries both equality **and** inequality conditions (MARK + MIXED is rejected at construction). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column indicating whether each left row had a match. Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column.
@@ -277,9 +277,10 @@ These operators are injected during pipeline splitting. They don't map to DuckDB
 Repartitions data into N buckets based on partition keys.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
-- **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
+- **Adaptive count:** the downstream consumer's `get_partition_strategy()` computes N from input data size and `hash_partition_bytes` (`natural_num_partitions()`). Fixed on the first task and never revised — later batches would otherwise land in slots computed under a different modulus.
 - **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
+- **Projected sizing (aggregate fanout):** the group-by partition sizes itself from a *projected* total rather than the bytes on hand, via `estimate_port_total_input_bytes()` (see [data management](data-management.md#runtime-data-size-estimation)). That is what lets its ingress be a `PARTIAL` barrier — `resolve_barrier` relaxes that edge only when `enable_runtime_size_estimation` is set on the partition, so with the setting off the ingress stays `FULL` as it always was. While the edge *is* relaxed, `get_next_task_hint()` withholds tasks until a projection is actually available, reproducing the `FULL` wait. On finalize the operator logs projected-vs-actual bytes at INFO so the projection's accuracy can be checked from a query log.
+- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`, `_size_estimate`
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`

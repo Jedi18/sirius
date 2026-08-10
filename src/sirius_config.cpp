@@ -250,6 +250,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("size_estimate_safety_factor", opt.size_estimate_safety_factor);
   r.reject_unknown();
 }
 
