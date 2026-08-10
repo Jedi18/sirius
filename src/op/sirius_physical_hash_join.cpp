@@ -787,6 +787,16 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   return {num_partitions, broadcast, build_probe};
 }
 
+void sirius_physical_hash_join::note_probe_bytes(
+  const std::shared_ptr<cucascade::data_batch>& batch)
+{
+  if (!batch) { return; }
+  auto ro = batch->to_read_only();
+  if (auto const* data = ro.get_data(); data != nullptr) {
+    _consumed_probe_bytes.fetch_add(data->get_size_in_bytes(), std::memory_order_relaxed);
+  }
+}
+
 partition_strategy sirius_physical_hash_join::get_partition_strategy(
   const partition_sizing_input& in)
 {
@@ -1048,6 +1058,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.push_back(probe_port->repo->pop_next_data_batch(p));
     input_batch.push_back(build_port->repo->pop_next_data_batch(p));
+    // BUILD_PROBE pops the probe batch, so this is its only sighting. Build bytes are never
+    // counted — see note_probe_bytes.
+    note_probe_bytes(input_batch.front());
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
                                                  std::memory_order_release);
     // Every task of partition p (this build+first-probe and all later probe-only tasks) shares the
@@ -1065,6 +1078,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     auto batch = probe_port->repo->pop_next_data_batch(p);
     if (batch) {
+      note_probe_bytes(batch);
       input_batch.push_back(std::move(batch));
     } else {
       SIRIUS_LOG_WARN(
@@ -1176,6 +1190,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   // thread must not remove a batch that another thread's get expects to find.
   std::lock_guard<std::mutex> lg(op_state_mutex);
 
+  // Latch build-side completion for consumed_primary_input_bytes(). Until the build side is
+  // whole, a probe batch processed now has been paired with fewer build batches than a later
+  // one will be, so output-per-probe-byte is still climbing and any ratio built from it
+  // under-reads. Cheap to recompute; only ever transitions false -> true.
+  if (auto* bp = get_port("build"); bp != nullptr && bp->src_pipeline) {
+    if (bp->src_pipeline->is_pipeline_finished()) {
+      _build_side_complete.store(true, std::memory_order_relaxed);
+    }
+  }
+
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     return get_next_task_input_data_for_build_probe();
   }
@@ -1208,6 +1232,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         std::to_string(step.partition) + " of operator " + std::to_string(this->get_operator_id()));
     }
 
+    // First entry into a task for this probe batch: probe_paired_count was just incremented for
+    // this pairing, so == 1 identifies the first. See note_probe_bytes for the contract.
+    if (c.probe_paired_count[step.probe_idx] == 1) { note_probe_bytes(probe_batch); }
+
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);
     input_batch.push_back(std::move(probe_batch));  // [0] = probe / "default" / left
@@ -1228,6 +1256,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     auto present_batch =
       present_port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
     if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
+
+    // An orphaned probe batch is consumed here without ever being paired, so the first-pairing
+    // hook never sees it. Count it now or consumed_primary_input_bytes() under-reports, which
+    // inflates the output-per-probe-byte ratio and over-projects downstream.
+    if (!orphan.present_is_build) { note_probe_bytes(present_batch); }
 
     // Synthesize the empty opposite side from the absent child's output schema (children[0] =
     // probe/left, children[1] = build/right), on the surviving batch's device. The absent child's

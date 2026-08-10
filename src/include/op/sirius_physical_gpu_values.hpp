@@ -128,6 +128,15 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
     const input_stats& stats) const override;
 
   /**
+   * @brief Exact total input basis: this source is single-shot, so its one task input is the
+   *        whole thing. Known from plan time, so the estimator can anchor on it immediately.
+   */
+  [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override
+  {
+    return estimated_source_bytes();
+  }
+
+  /**
    * @brief Viability gate: throw for output types the host→device conversion
    *        cannot represent faithfully, triggering DuckDB CPU fallback.
    *
