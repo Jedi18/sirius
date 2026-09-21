@@ -27,12 +27,16 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/group_by_bypass_policy.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <optional>
 
 namespace sirius {
 namespace planner {
@@ -142,11 +146,47 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /// Bytes the reservation for this merge's task must not fall below.
+  ///
+  /// Nonzero only when the group-by bypass prototype actually selected P=1 for this operator: the
+  /// unpartitioned merge is then the whole aggregation, and a warm pipeline's history — recorded
+  /// from *partitioned* merges that each saw a fraction of the input — predicts far less memory
+  /// than it needs. Unlike no_history_peak_memory_estimate, which the task consults only on a
+  /// cold pipeline, this floor is applied whether or not history exists.
+  [[nodiscard]] std::size_t mandatory_peak_memory_floor(
+    const op::input_stats& stats) const override;
+
+  /// Test seam: the decision this operator last recorded, or nullopt if it never ran the policy.
+  /// Non-const because the operator's `lock` is not mutable.
+  [[nodiscard]] std::optional<group_by_bypass::decision> last_bypass_decision()
+  {
+    std::lock_guard<std::mutex> lg(lock);
+    return _bypass_decision;
+  }
+
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
+  /// Run the bypass policy against @p in. Returns the automatic count untouched whenever the
+  /// prototype is off or any gate rejects the candidate. @pre `lock` is NOT held.
+  [[nodiscard]] int apply_memory_aware_bypass(const partition_sizing_input& in, int natural);
+
+  /// Whether every physical aggregate partial state this merge will re-merge is inside the v1
+  /// fixed-width whitelist. Checks `cudf_aggregates` (the merge-time kinds) rather than the SQL
+  /// output types: a logical COUNT arrives as a COUNT_ALL/COUNT_VALID state re-merged with SUM,
+  /// and a COUNT(DISTINCT) arrives as a LIST.
+  [[nodiscard]] bool bypass_supported_aggregates() const;
+
   bool _fuse_into_parent = false;
+
+  /// Set once by apply_memory_aware_bypass during partition sizing. Guarded by `lock`.
+  std::optional<group_by_bypass::decision> _bypass_decision;
+
+  /// The floor mandatory_peak_memory_floor returns, published separately from `_bypass_decision`
+  /// so the executor thread can read it without taking this operator's lock (and without relying
+  /// on the task hand-off alone to order the two).
+  std::atomic<std::size_t> _bypass_reservation_floor{0};
 };
 
 }  // namespace op
