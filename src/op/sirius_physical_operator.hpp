@@ -563,8 +563,10 @@ class sirius_physical_operator {
    * a single batch, or partition with a single partition), or a higher value for operators
    * that expand input significantly (e.g. decompressing parquet).
    *
-   * A return value of 0 means "no additional peak memory expected"; the caller will fall
-   * back to the 2× default when every operator in the pipeline returns 0.
+   * A return value of 0 means "no additional peak memory expected" and is authoritative.
+   * The caller takes the maximum over the pipeline's operators, including zeros, and adds
+   * input materialization separately. The task-level 2× fallback applies only when there
+   * are no operators to consult; operators without an override use this class's 2× default.
    *
    * @param stats  Batch count and total input bytes for the task about to run.
    * @return Estimated peak GPU bytes this operator will allocate.

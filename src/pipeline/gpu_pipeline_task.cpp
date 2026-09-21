@@ -871,15 +871,16 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, conversion_floor);
     }
   } else {
-    std::size_t max_estimate = 0;
+    std::optional<std::size_t> max_estimate;
     if (auto* pipeline = gs.get_pipeline()) {
       for (auto& op_ref : pipeline->get_operators()) {
-        max_estimate = std::max(max_estimate, op_ref.get().no_history_peak_memory_estimate(stats));
+        max_estimate =
+          std::max(max_estimate.value_or(0), op_ref.get().no_history_peak_memory_estimate(stats));
       }
     }
-    // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
-    info.peak_memory_estimate =
-      (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
+    // Zero is authoritative for pass-through operators. Only an absent/empty pipeline needs
+    // the task-level fallback; operators without an override already supply the 2× default.
+    info.peak_memory_estimate = max_estimate.value_or(memory::saturating_mul(input_basis, 2));
   }
 
   auto const normal_reservation =

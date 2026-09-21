@@ -583,6 +583,110 @@ TEST_CASE("pipeline memory history clamps extrapolated estimates",
   }
 }
 
+TEST_CASE("cold pipeline reservations honor zero operator estimates",
+          "[gpu_pipeline_task][history][estimation]")
+{
+  constexpr std::size_t input_bytes         = 1024;
+  auto ctx                                  = create_pipeline_context();
+  ctx.stub_op->no_history_estimate_override = 0;
+  std::size_t expected_peak                 = 0;
+  bool expected_history                     = false;
+
+  SECTION("a single pass-through reserves no operator memory") {}
+
+  SECTION("multiple pass-throughs reserve no operator memory")
+  {
+    ctx.stub_source->no_history_estimate_override = 0;
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_source);
+  }
+
+  SECTION("an operator with the default estimate keeps the conservative bound")
+  {
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_source);
+    expected_peak = 2 * input_bytes;
+  }
+
+  SECTION("a positive estimate wins even when followed by a zero")
+  {
+    ctx.stub_op->no_history_estimate_override     = input_bytes;
+    ctx.stub_source->no_history_estimate_override = 0;
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_source);
+    expected_peak = input_bytes;
+  }
+
+  SECTION("an empty pipeline keeps the task fallback")
+  {
+    ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
+      sirius::pipeline::pipeline_build_context{nullptr, true});
+    expected_peak = 2 * input_bytes;
+  }
+
+  SECTION("an absent pipeline keeps the task fallback")
+  {
+    ctx.pipeline.reset();
+    expected_peak = 2 * input_bytes;
+  }
+
+  SECTION("history supersedes a cold zero estimate")
+  {
+    expected_history = true;
+    expected_peak    = 3 * input_bytes;
+  }
+
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  if (expected_history) {
+    global_state->get_memory_history().record({input_bytes, expected_peak, input_bytes});
+  }
+  auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+    std::make_unique<sized_input>(input_bytes));
+  auto* local_state_ptr = local_state.get();
+  auto task             = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1, std::vector<cucascade::shared_data_repository*>{}, std::move(local_state), global_state);
+
+  auto const estimate = task->get_estimated_reservation_size_info(nullptr);
+  CHECK(estimate.had_history == expected_history);
+  CHECK(estimate.input_basis == input_bytes);
+  CHECK(estimate.peak_memory_estimate == expected_peak);
+  CHECK(estimate.bytes_to_materialize_input == 0);
+  CHECK(estimate.reservation_size == expected_peak);
+
+  // Even a zero initial reservation must grow after an unexpected allocation OOMs.
+  local_state_ptr->update_retry_reservation_floor_after_oom(
+    estimate.reservation_size, 256, std::nullopt);
+  auto const retry = task->get_estimated_reservation_size_info(nullptr);
+  CHECK(retry.peak_memory_estimate == expected_peak);
+  CHECK(retry.retry_reservation_floor > estimate.reservation_size);
+  CHECK(retry.reservation_size == retry.retry_reservation_floor);
+}
+
+TEST_CASE("cold zero operator estimates still reserve input materialization",
+          "[gpu_pipeline_task][history][estimation]")
+{
+  pipeline_task_history_fixture fixture;
+  if (!fixture.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  auto ctx                                  = create_pipeline_context();
+  ctx.stub_op->no_history_estimate_override = 0;
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  auto batch = fixture.create_compressed_host_data_batch(128, 1024);
+  auto task  = create_pipeline_task(fixture, global_state, std::move(batch), 0, 1);
+
+  auto const estimate = task->get_estimated_reservation_size_info(fixture.gpu_space);
+  CHECK_FALSE(estimate.had_history);
+  CHECK(estimate.input_basis == 1024);
+  CHECK(estimate.peak_memory_estimate == 0);
+  CHECK(estimate.bytes_to_materialize_input == 128 + 1024);
+  CHECK(estimate.reservation_size == 128 + 1024);
+}
+
 TEST_CASE("gpu pipeline reservation estimates saturate instead of wrapping",
           "[gpu_pipeline_task][history][estimation]")
 {

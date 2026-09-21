@@ -556,7 +556,7 @@ std::size_t sirius_physical_partition::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
   if (_num_partitions.has_value() && *_num_partitions == 1) { return 0; }
-  return stats.bytes * 2;
+  return memory::saturating_mul(stats.bytes, 2);
 }
 
 }  // namespace op

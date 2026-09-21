@@ -140,7 +140,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: many batches returns bytes",
 // sirius_physical_partition
 // ---------------------------------------------------------------------------
 
-TEST_CASE("partition no_history_peak_memory_estimate: num_partitions unset returns bytes",
+TEST_CASE("partition no_history_peak_memory_estimate: num_partitions unset returns 2× bytes",
           "[no_history_peak_memory_estimate][partition]")
 {
   // _num_partitions is nullopt after construction with a hash join parent.
@@ -164,7 +164,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: 1 partition returns 0",
   REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 0);
 }
 
-TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns bytes",
+TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns 2× bytes",
           "[no_history_peak_memory_estimate][partition]")
 {
   auto f = make_hash_join();
@@ -176,7 +176,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns bytes
   REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 4000);
 }
 
-TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns bytes",
+TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns 2× bytes",
           "[no_history_peak_memory_estimate][partition]")
 {
   auto f = make_hash_join();
@@ -186,6 +186,21 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
     f.hash_join.get()};
   part.set_num_partitions(8);
   REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
+}
+
+TEST_CASE("partition cold estimate saturates for oversized inputs",
+          "[no_history_peak_memory_estimate][partition]")
+{
+  auto f = make_hash_join();
+  sirius_physical_partition part{
+    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get()};
+  constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+
+  CHECK(part.no_history_peak_memory_estimate({1, max_size / 2 + 1}) == max_size);
+  part.set_num_partitions(2);
+  CHECK(part.no_history_peak_memory_estimate({1, max_size / 2 + 1}) == max_size);
+  part.set_num_partitions(1);
+  CHECK(part.no_history_peak_memory_estimate({1, max_size}) == 0);
 }
 
 TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",
