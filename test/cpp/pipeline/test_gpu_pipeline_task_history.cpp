@@ -621,6 +621,10 @@ TEST_CASE("cold pipeline reservations honor zero operator estimates",
   {
     ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
       sirius::pipeline::pipeline_build_context{nullptr, true});
+    // Task teardown checks pipeline completion through the sink even when the operator
+    // chain is empty. Keep that lifecycle valid without adding an operator estimate.
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
     expected_peak = 2 * input_bytes;
   }
 
