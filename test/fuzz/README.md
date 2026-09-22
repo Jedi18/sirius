@@ -73,6 +73,10 @@ pixi run -e duckdb-python fuzz-test                                        # har
 pixi run -e duckdb-python fuzz selftest                                    # CPU-vs-CPU pipeline check, no GPU
 ```
 
+The submodule-built module reports its git hash as the DuckDB version while the extension
+carries `OVERRIDE_GIT_DESCRIBE`'s `v1.5.5`; the session retries `LOAD` with
+`allow_extensions_metadata_mismatch` on exactly that error (same source tree, same ABI).
+
 `--sirius-config` selects the Sirius YAML (default `test/cpp/integration/integration.yaml`);
 repeat it to round-robin worker processes across configs, e.g. a low GPU memory cap to force
 downgrade and spill. `--cpu-only` runs without the extension and compares CPU with CPU, which is
