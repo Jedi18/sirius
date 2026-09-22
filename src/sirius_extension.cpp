@@ -3169,7 +3169,7 @@ static void SetGroupByBypassHeadroomFraction(ClientContext& context,
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto const value = DoubleValue::Get(parameter);
-  if (value < 0.0 || value > 4.0) {
+  if (!(value >= 0.0 && value <= 4.0)) {
     throw duckdb::InvalidInputException(
       "group_by_bypass_headroom_fraction must be between 0.0 and 4.0");
   }
@@ -3564,8 +3564,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
 
-  // Experiment (issue #1746 point 2). Internal visibility: this is a prototype whose memory model
-  // has not been validated against the pinned cuDF implementation, not a production knob.
+  // Experiment (issue #1746 point 2). Internal visibility: selection uses a budget snapshot,
+  // not a secured reservation, and automatic repartitioning after OOM is not implemented.
   add_sirius_option(
     config,
     option_visibility::internal,

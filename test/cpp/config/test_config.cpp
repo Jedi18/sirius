@@ -679,7 +679,7 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
 TEST_CASE("the group-by bypass experiment is off by default and bounds its one knob",
           "[config_opt][group_by_bypass]")
 {
-  // Default off matters: this is an unvalidated experiment, so a config that does not mention it
+  // Default off matters: this is an opt-in experiment, so a config that does not mention it
   // must never turn it on.
   CHECK_FALSE(operator_params{}.enable_group_by_memory_aware_bypass);
   CHECK(operator_params{}.group_by_bypass_headroom_fraction == 0.25);
@@ -721,6 +721,25 @@ TEST_CASE("the group-by bypass experiment is off by default and bounds its one k
     sirius_config cfg;
     cfg.load_from_file(path);
     CHECK(cfg.get_operator_params().group_by_bypass_headroom_fraction == 0.0);
+  }
+
+  SECTION("non-finite margins are rejected")
+  {
+    for (auto const* value : {".nan", ".inf", "-.inf"}) {
+      INFO("headroom = " << value);
+      auto const body = std::string("    group_by_bypass_headroom_fraction: ") + value + "\n";
+      write(body.c_str());
+      sirius_config cfg;
+      CHECK_THROWS_AS(cfg.load_from_file(path), std::runtime_error);
+    }
+  }
+
+  SECTION("the upper boundary is allowed")
+  {
+    write("    group_by_bypass_headroom_fraction: 4.0\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().group_by_bypass_headroom_fraction == 4.0);
   }
 
   std::error_code ec;

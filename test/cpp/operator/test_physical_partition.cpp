@@ -686,7 +686,12 @@ TEST_CASE("bypass metadata reports the real rows, schema and target device",
   bypass_metadata_fixture f;
   REQUIRE(f.partition.is_memory_aware_bypass_enabled());
   f.finish(f.received_bytes);
-  REQUIRE(f.partition.get_next_task_input_data());
+  // Keep the returned task input alive while checking the budget. It owns the batch popped from
+  // the repository; destroying it here would release the batch's aligned GPU allocation after
+  // collect_bypass_metadata() took its snapshot and make the later charged-byte sample 512 bytes
+  // smaller than the state represented by the metadata.
+  auto task_input = f.partition.get_next_task_input_data();
+  REQUIRE(task_input);
 
   REQUIRE(f.consumer.bypass_metadata.has_value());
   auto const& meta = *f.consumer.bypass_metadata;

@@ -196,8 +196,8 @@ struct operator_params {
   bool enable_group_by_memory_aware_bypass = false;
 
   /// Declared empirical margin the bypass model adds on top of its modelled requirement, as a
-  /// fraction of it. The single tuning knob the prototype introduces; reported in every decision
-  /// record. Only read when enable_group_by_memory_aware_bypass is true.
+  /// finite fraction in [0.0, 4.0]. Included in the required bytes logged for each decision.
+  /// Only read when enable_group_by_memory_aware_bypass is true.
   double group_by_bypass_headroom_fraction = 0.25;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
