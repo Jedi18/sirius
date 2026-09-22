@@ -65,13 +65,15 @@ class CrashReasonTests(unittest.TestCase):
 
         text = (
             "*** SIGSEGV — backtrace from faulting thread ***\nFaulting thread id:1\n"
-            "  #0   /lib/aarch64-linux-gnu/libc.so.6(+0x1) [0x2]\n"
-            "  #1   /home/x/ext/sirius.duckdb_extension(+0x51f51c) [0x3]\n"
+            "  #0   /home/x/ext/sirius.duckdb_extension(+0x681f44) [0x1]\n"
+            "  #1   /lib/aarch64-linux-gnu/libc.so.6(+0x1) [0x2]\n"
+            "  #2   /home/x/ext/sirius.duckdb_extension(+0x51f51c) [0x3]\n"
+            "  #3   /home/x/ext/sirius.duckdb_extension(+0x52a2ec) [0x4]\n"
             "*** end backtrace ***\n"
         )
+        # Without addr2line the first extension frame is Sirius's handler and is dropped.
         self.assertEqual(
-            extract_crash_reason(text, 1),
-            "SIGSEGV at sirius.duckdb_extension(+0x51f51c)",
+            extract_crash_reason(text, 1), "SIGSEGV in +0x51f51c < +0x52a2ec"
         )
 
     def test_no_backtrace(self):

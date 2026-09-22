@@ -84,9 +84,16 @@ Outputs go to `test/fuzz/out/run-<timestamp>-seed<seed>/`:
 summary.txt / summary.json      verdict counts, unique findings, fallback reason histogram, feature stats
 queries.jsonl                   one record per query
 datasets/w<worker>-d<n>.sql     every generated dataset (CREATE + INSERT + CHECKPOINT)
+logs/w<worker>-s<spawn>.stderr  each worker process's stderr (Sirius backtraces land here)
 findings/<n>-<verdict>-<hash>/  query.sql, reduced.sql, dataset.sql, detail.txt, meta.json,
-                                config.toml, repro_catch2.cpp
+                                config.toml, repro_catch2.cpp, query-<k>.sql for further
+                                reproducers of the same signature
 ```
+
+A crash is attributed to the in-flight query; its reason is the `std::terminate` message or
+the signal plus the first extension frames below Sirius's signal handler (symbolized with
+`addr2line` when available). Workers are respawned after crashes and hangs up to
+`--max-respawns` (default 200).
 
 A finding directory replays on its own: `fuzz replay <dir>` loads `dataset.sql`, runs
 `reduced.sql` (or `query.sql` with `--original`) and prints the verdict.

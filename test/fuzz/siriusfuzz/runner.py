@@ -20,6 +20,8 @@ import pathlib
 import queue as queue_mod
 import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -482,16 +484,36 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
 _SIGNAL_RE = re.compile(r"\*\*\* (SIG[A-Z]+)")
 _WHAT_RE = re.compile(r"what\(\):\s*(.+)")
 _TERMINATE_RE = re.compile(r"terminate called after throwing an instance of '([^']+)'")
-_FRAME_RE = re.compile(
-    r"#\d+\s+\S*?(sirius\.duckdb_extension|libcudf\.so|librmm\.so)\(([^)]*)\)"
-)
+_EXT_FRAME_RE = re.compile(r"#\d+\s+\S*?sirius\.duckdb_extension\((\+0x[0-9a-f]+)\)")
+_HANDLER_NAMES = ("segfault_handler", "signal_handler", "sigaction", "backtrace")
 
 
-def extract_crash_reason(stderr_tail: str, exitcode: int | None) -> str:
+def symbolize(extension: str | None, offsets: list[str]) -> list[str]:
+    """Function names for extension offsets via addr2line; offsets when unavailable."""
+    if not extension or not offsets or shutil.which("addr2line") is None:
+        return offsets
+    try:
+        out = subprocess.run(
+            ["addr2line", "-f", "-C", "-e", extension, *offsets],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return offsets
+    names = out[0::2]  # -f prints function, then file:line
+    return [n if n and n != "??" else off for n, off in zip(names, offsets)] or offsets
+
+
+def extract_crash_reason(
+    stderr_tail: str, exitcode: int | None, extension: str | None = None
+) -> str:
     """Short, dedup-friendly description of a worker death from its captured stderr.
 
-    Prefers the std::terminate what() text, then the signal plus the first frame inside the
-    extension (offsets are stable within one build), then the bare exit code.
+    Prefers the std::terminate what() text, then the signal plus the first frames inside
+    the extension below Sirius's own signal handler (symbolized when addr2line exists;
+    offsets are stable within one build), then the bare exit code.
     """
     blocks = stderr_tail.split("*** end backtrace ***")
     text = blocks[-2] if len(blocks) >= 2 else stderr_tail  # last crash block only
@@ -503,8 +525,14 @@ def extract_crash_reason(stderr_tail: str, exitcode: int | None) -> str:
         exc = f" ({term.group(1)})" if term else ""
         return f"{prefix}{exc}: {what.group(1).strip()}"
     if sig:
-        frame = _FRAME_RE.search(text)
-        where = f" at {frame.group(1)}({frame.group(2)})" if frame else ""
+        offsets = _EXT_FRAME_RE.findall(text)[:5]
+        names = symbolize(extension, offsets)
+        frames = [n for n in names if not any(h in n for h in _HANDLER_NAMES)]
+        if frames and frames == names and len(frames) > 1:
+            frames = frames[
+                1:
+            ]  # unsymbolized: the first extension frame is the handler
+        where = " in " + " < ".join(f[:80] for f in frames[:3]) if frames else ""
         return f"{sig.group(1)}{where}"
     return f"worker exited with code {exitcode}"
 
@@ -680,7 +708,7 @@ class Orchestrator:
         info = self.inflight.pop(w, None)
         finished.add(w)
         tail = self._stderr_tail(w)
-        reason = extract_crash_reason(tail, p.exitcode)
+        reason = extract_crash_reason(tail, p.exitcode, self.opts.extension)
         if info is not None:
             sql, stem, _, query_labels = info
             rec = QueryRecord(
