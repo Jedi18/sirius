@@ -404,6 +404,20 @@ class Select(Node):
     def output_kinds(self) -> list[str]:
         return [i.expr.kind for i in self.items]
 
+    def label(self) -> str:
+        tags = [
+            t
+            for t, on in (
+                ("group_by", bool(self.group_by)),
+                ("having", self.having is not None),
+                ("distinct", self.distinct),
+                ("order_by", bool(self.order_by)),
+                ("limit", self.limit is not None),
+            )
+            if on
+        ]
+        return "Select" + (f"({','.join(tags)})" if tags else "")
+
     def sql(self) -> str:
         parts: list[str] = []
         if self.ctes:

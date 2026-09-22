@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import dataclasses
 import multiprocessing as mp
+import os
 import pathlib
 import queue as queue_mod
 import random
+import re
 import sys
 import time
 import traceback
@@ -35,7 +37,6 @@ from .session import RunResult, Session
 from .sqlast import Query, labels
 
 HANG_GRACE_SECONDS = 30.0
-MAX_RESPAWNS = 10
 
 
 @dataclass
@@ -48,6 +49,7 @@ class WorkerArgs:
     max_queries: int | None  # per worker
     deadline: float | None  # time.time() at which to stop
     reduce: bool = True
+    stderr_path: str | None = None  # per-worker capture of native backtraces
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +361,13 @@ class Evaluator:
 def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
     w = args.worker_id
     run_dir = pathlib.Path(args.run_dir)
+    if args.stderr_path:
+        # Sirius prints its signal-handler backtrace and std::terminate messages to fd 2; the
+        # orchestrator reads this file when the process dies.
+        pathlib.Path(args.stderr_path).parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(args.stderr_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 2)
+        os.close(fd)
 
     def send(msg: dict[str, Any]) -> None:
         msg["worker"] = w
@@ -426,7 +435,14 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     break
                 query = qgen.generate()
                 sql = query.sql()
-                send({"type": "begin", "sql": sql, "dataset": stem})
+                send(
+                    {
+                        "type": "begin",
+                        "sql": sql,
+                        "dataset": stem,
+                        "labels": labels(query),
+                    }
+                )
                 try:
                     rec = evaluator.evaluate(query, sql, w, stem, ds_seed)
                     if (
@@ -460,6 +476,40 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
 
 
 # --------------------------------------------------------------------------
+# crash reasons
+# --------------------------------------------------------------------------
+
+_SIGNAL_RE = re.compile(r"\*\*\* (SIG[A-Z]+)")
+_WHAT_RE = re.compile(r"what\(\):\s*(.+)")
+_TERMINATE_RE = re.compile(r"terminate called after throwing an instance of '([^']+)'")
+_FRAME_RE = re.compile(
+    r"#\d+\s+\S*?(sirius\.duckdb_extension|libcudf\.so|librmm\.so)\(([^)]*)\)"
+)
+
+
+def extract_crash_reason(stderr_tail: str, exitcode: int | None) -> str:
+    """Short, dedup-friendly description of a worker death from its captured stderr.
+
+    Prefers the std::terminate what() text, then the signal plus the first frame inside the
+    extension (offsets are stable within one build), then the bare exit code.
+    """
+    blocks = stderr_tail.split("*** end backtrace ***")
+    text = blocks[-2] if len(blocks) >= 2 else stderr_tail  # last crash block only
+    what = _WHAT_RE.search(text)
+    term = _TERMINATE_RE.search(text)
+    sig = _SIGNAL_RE.search(text)
+    if what:
+        prefix = sig.group(1) if sig else "terminate"
+        exc = f" ({term.group(1)})" if term else ""
+        return f"{prefix}{exc}: {what.group(1).strip()}"
+    if sig:
+        frame = _FRAME_RE.search(text)
+        where = f" at {frame.group(1)}({frame.group(2)})" if frame else ""
+        return f"{sig.group(1)}{where}"
+    return f"worker exited with code {exitcode}"
+
+
+# --------------------------------------------------------------------------
 # orchestrator
 # --------------------------------------------------------------------------
 
@@ -474,6 +524,7 @@ class OrchestratorOptions:
     reduce: bool = True
     progress_every: float = 10.0
     quiet: bool = False
+    max_respawns: int = 200  # crashes are findings, not a reason to stop the run
 
 
 class Orchestrator:
@@ -488,7 +539,8 @@ class Orchestrator:
         self.queue = self.ctx.Queue()
         self.stop = self.ctx.Event()
         self.procs: dict[int, Any] = {}
-        self.inflight: dict[int, tuple[str, str, float]] = {}
+        self.inflight: dict[int, tuple[str, str, float, list[str]]] = {}
+        self.stderr_paths: dict[int, str] = {}
         self.last_seen: dict[int, float] = {}
         self.respawns = 0
         self.spawn_count = 0
@@ -506,6 +558,9 @@ class Orchestrator:
         if self.opts.max_queries is not None:
             per_worker = max(1, -(-self.opts.max_queries // self.opts.workers))
         deadline = time.time() + self.opts.duration if self.opts.duration else None
+        stderr_path = str(
+            self.report.run_dir / "logs" / f"w{worker_id}-s{self.spawn_count}.stderr"
+        )
         args = WorkerArgs(
             worker_id,
             seed,
@@ -515,7 +570,9 @@ class Orchestrator:
             per_worker,
             deadline,
             self.opts.reduce,
+            stderr_path,
         )
+        self.stderr_paths[worker_id] = stderr_path
         p = self.ctx.Process(
             target=worker_main,
             args=(args, self.cfg, self.queue, self.stop),
@@ -580,7 +637,12 @@ class Orchestrator:
         self.last_seen[w] = time.time()
         t = msg["type"]
         if t == "begin":
-            self.inflight[w] = (msg["sql"], msg["dataset"], time.time())
+            self.inflight[w] = (
+                msg["sql"],
+                msg["dataset"],
+                time.time(),
+                msg.get("labels", []),
+            )
         elif t == "result":
             self.inflight.pop(w, None)
             rec = QueryRecord(**msg["record"])
@@ -604,33 +666,54 @@ class Orchestrator:
             if msg.get("reason") != "finished":
                 self._say(f"[w{w}] stopped: {msg.get('reason')}")
 
+    def _stderr_tail(self, w: int) -> str:
+        path = self.stderr_paths.get(w)
+        if not path or not os.path.exists(path):
+            return ""
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 16000))
+            return fh.read().decode("utf-8", "replace")
+
     def _worker_died(self, w: int, p: Any, finished: set[int]) -> None:
         info = self.inflight.pop(w, None)
         finished.add(w)
+        tail = self._stderr_tail(w)
+        reason = extract_crash_reason(tail, p.exitcode)
         if info is not None:
-            sql, stem, _ = info
+            sql, stem, _, query_labels = info
             rec = QueryRecord(
                 w,
                 stem,
                 self.seed,
                 sql,
                 Verdict.CRASH.value,
-                reason=f"worker exited with code {p.exitcode}",
+                reason=reason,
+                detail=tail[-4000:],
+                labels=query_labels,
             )
             self.report.add(rec)
-            self._say(f"[w{w}] CRASH (exit {p.exitcode}) during query; recorded")
+            self._say(f"[w{w}] CRASH (exit {p.exitcode}) during query: {reason[:120]}")
         elif p.exitcode not in (0, None):
-            self._say(f"[w{w}] worker exited with code {p.exitcode} outside a query")
+            self._say(
+                f"[w{w}] worker exited with code {p.exitcode} outside a query: {reason[:120]}"
+            )
         self._maybe_respawn(w, finished)
 
     def _worker_hung(
-        self, w: int, p: Any, info: tuple[str, str, float], finished: set[int]
+        self,
+        w: int,
+        p: Any,
+        info: tuple[str, str, float, list[str]],
+        finished: set[int],
     ) -> None:
-        sql, stem, since = info
+        sql, stem, since, query_labels = info
         self.inflight.pop(w, None)
         p.kill()
         p.join(timeout=5)
         finished.add(w)
+        tail = self._stderr_tail(w)
         rec = QueryRecord(
             w,
             stem,
@@ -638,18 +721,24 @@ class Orchestrator:
             sql,
             Verdict.TIMEOUT.value,
             reason=f"no progress for {time.time() - since:.0f}s; worker killed",
+            detail=tail[-4000:],
+            labels=query_labels,
         )
         self.report.add(rec)
         self._say(f"[w{w}] HANG: killed after {time.time() - since:.0f}s")
         self._maybe_respawn(w, finished)
 
     def _maybe_respawn(self, w: int, finished: set[int]) -> None:
-        if self.stop.is_set() or self.respawns >= MAX_RESPAWNS:
+        if self.stop.is_set() or self.respawns >= self.opts.max_respawns:
+            if not self.stop.is_set():
+                self._say(
+                    f"[w{w}] respawn cap {self.opts.max_respawns} reached; worker not restarted"
+                )
             return
         self.respawns += 1
         finished.discard(w)
         self._spawn(w)
-        self._say(f"[w{w}] respawned ({self.respawns}/{MAX_RESPAWNS})")
+        self._say(f"[w{w}] respawned ({self.respawns}/{self.opts.max_respawns})")
 
     def _progress(self, start: float) -> None:
         elapsed = time.time() - start

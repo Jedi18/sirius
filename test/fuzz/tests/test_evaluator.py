@@ -139,7 +139,10 @@ class ReportTests(unittest.TestCase):
             )
             known = [
                 KnownIssue(
-                    "count\\(DISTINCT", "sirius-db/sirius#1218", verdicts=["gpu_error"]
+                    ".",
+                    "sirius-db/sirius#1218",
+                    verdicts=["gpu_error"],
+                    sql_pattern="count\\(DISTINCT",
                 )
             ]
             report = Report(run_dir, cfg, known, seed=1)

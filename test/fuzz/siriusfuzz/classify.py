@@ -120,8 +120,33 @@ def classify_gpu_error(message: str) -> tuple[Verdict, str]:
     return Verdict.GPU_ERROR, body
 
 
+_UNSUPPORTED_EXPR_RE = re.compile(
+    r"^(Unsupported (?:filter predicate|expression in \w+|expression on the \w+ side of a join condition))"
+    r"(?: on column '[^']*')?\s*(?:\(falling back to CPU\))?:\s*(.*)$",
+    re.DOTALL,
+)
+_FUNC_NAME_RE = re.compile(r"\b([a-z_][a-z0-9_]*)\s*\(")
+_NOT_FUNCS = {"cast", "case", "when", "in", "not", "and", "or", "coalesce", "between"}
+
+
 def normalize_reason(reason: str) -> str:
-    """Collapse identifiers, numbers and expression text so one root cause dedups to one key."""
+    """Collapse identifiers, numbers and expression text so one root cause dedups to one key.
+
+    An "Unsupported <expression>" reason is reduced to the set of function names in the
+    expression, since the function Sirius cannot translate is the root cause, not the shape.
+    """
+    m = _UNSUPPORTED_EXPR_RE.match(reason.strip())
+    if m:
+        funcs = sorted(
+            {
+                f
+                for f in _FUNC_NAME_RE.findall(m.group(2).lower())
+                if f not in _NOT_FUNCS
+            }
+        )
+        return (
+            f"{m.group(1)}: {{{', '.join(funcs)}}}" if funcs else f"{m.group(1)}: {{}}"
+        )
     s = reason
     s = re.sub(r"'[^']*'", "'?'", s)
     s = re.sub(r'"[^"]*"', '"?"', s)

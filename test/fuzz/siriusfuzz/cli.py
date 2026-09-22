@@ -129,6 +129,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         sirius_configs=sirius_configs,
         reduce=not args.no_reduce,
         quiet=args.quiet,
+        max_respawns=args.max_respawns,
     )
     if opts.duration is None and opts.max_queries is None:
         opts.max_queries = 500
@@ -299,6 +300,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workers", type=int, default=1)
     run.add_argument("--out", help=f"output root (default {FUZZ_DIR / 'out'})")
     run.add_argument("--no-reduce", action="store_true")
+    run.add_argument(
+        "--max-respawns",
+        type=int,
+        default=200,
+        help="worker restarts after crashes/hangs before giving up",
+    )
     run.add_argument("--quiet", action="store_true")
     run.add_argument(
         "--fail-on-findings",

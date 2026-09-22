@@ -42,16 +42,24 @@ class QueryRecord:
 
 @dataclass
 class KnownIssue:
-    pattern: str
+    pattern: str  # regex over the finding's reason and detail text
     issue: str
     note: str = ""
     verdicts: list[str] = field(default_factory=list)
+    sql_pattern: str = ""  # optional regex over the (reduced) query; both must match
 
     def matches(self, rec: QueryRecord) -> bool:
         if self.verdicts and rec.verdict not in self.verdicts:
             return False
-        hay = "\n".join([rec.reason, rec.detail, rec.reduced_sql or "", rec.sql])
-        return re.search(self.pattern, hay, re.IGNORECASE | re.MULTILINE) is not None
+        flags = re.IGNORECASE | re.MULTILINE
+        if re.search(self.pattern, rec.reason + "\n" + rec.detail, flags) is None:
+            return False
+        if self.sql_pattern:
+            return (
+                re.search(self.sql_pattern, rec.reduced_sql or rec.sql, flags)
+                is not None
+            )
+        return True
 
 
 def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
@@ -69,9 +77,13 @@ def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
                 item["issue"],
                 item.get("note", ""),
                 list(item.get("verdicts", [])),
+                item.get("sql_pattern", ""),
             )
         )
     return out
+
+
+EXTRA_REPRODUCERS = 5  # additional query-<n>.sql files kept per deduplicated finding
 
 
 def signature(rec: QueryRecord) -> str:
@@ -83,6 +95,8 @@ def signature(rec: QueryRecord) -> str:
         Verdict.GPU_INTERNAL_ERROR,
         Verdict.GPU_OOM,
     ):
+        key = f"{v}|{normalize_reason(rec.reason)}"
+    elif v == Verdict.CRASH and ("SIG" in rec.reason or "terminate" in rec.reason):
         key = f"{v}|{normalize_reason(rec.reason)}"
     elif v == Verdict.VARIANT_MISMATCH:
         setting = next(iter(rec.variant or {}), "")
@@ -146,7 +160,11 @@ class Report:
             return None
         sig = signature(rec)
         if sig in self.findings:
-            self.findings[sig]["count"] += 1
+            entry = self.findings[sig]
+            entry["count"] += 1
+            if entry["count"] <= EXTRA_REPRODUCERS + 1:
+                d = self.run_dir / "findings" / entry["name"]
+                (d / f"query-{entry['count']}.sql").write_text(rec.sql.rstrip() + ";\n")
             return None
         name = f"{len(self.findings):03d}-{rec.verdict}-{short_hash(sig)}"
         self.findings[sig] = {
