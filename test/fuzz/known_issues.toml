@@ -1,0 +1,9 @@
+# Findings matching a pattern are reported as known_issue (counted, not failed).
+# Every entry needs an issue link; `pattern` is a case-insensitive regex matched
+# against the reason, detail, and (reduced) SQL. Optional `verdicts` restricts it.
+
+[[issue]]
+pattern = "count\\(DISTINCT[^)]*\\)"
+issue = "sirius-db/sirius#1218"
+note = "ungrouped COUNT(DISTINCT) runtime-falls-back to CPU"
+verdicts = ["gpu_error"]

@@ -129,6 +129,9 @@ setuptools-scm = "*"
 
 [feature.duckdb-python.tasks]
 build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
+# Differential fuzzer (test/fuzz/README.md). Needs build-duckdb-python and a built extension.
+fuzz = { cmd = "python -m siriusfuzz", cwd = "test/fuzz", description = "Run the Sirius differential fuzzer: fuzz run|replay|replay-file|show-config|selftest" }
+fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
 
 [feature.nightly-runner]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
