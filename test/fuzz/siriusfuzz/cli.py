@@ -25,6 +25,17 @@ from .session import Session
 DEFAULT_PROFILE = FUZZ_DIR / "config" / "strict.toml"
 
 
+def sql_statements(text: str) -> list[str]:
+    """Split a dataset/query file on statement-ending semicolons, dropping `--` comment lines."""
+    out = []
+    for chunk in text.split(";\n"):
+        lines = [ln for ln in chunk.splitlines() if not ln.strip().startswith("--")]
+        stmt = "\n".join(lines).strip().rstrip(";")
+        if stmt:
+            out.append(stmt)
+    return out
+
+
 def parse_duration(text: str | None) -> float | None:
     if text is None:
         return None
@@ -179,9 +190,8 @@ def _dataset_from_args(
                 p.unlink()
         session.con.execute(f"ATTACH '{path}' AS replay")
         session.con.execute("USE replay")
-        for stmt in sql_path.read_text().split(";\n"):
-            if stmt.strip() and not stmt.strip().startswith("--"):
-                session.con.execute(stmt)
+        for stmt in sql_statements(sql_path.read_text()):
+            session.con.execute(stmt)
         session.con.execute("CHECKPOINT")
         session.current_alias = "replay"
         return None

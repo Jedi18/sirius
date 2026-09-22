@@ -66,3 +66,17 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliHelpers(unittest.TestCase):
+    def test_sql_statements_strips_comment_lines(self):
+        from siriusfuzz.cli import parse_duration, sql_statements
+
+        text = "-- header\nCREATE TABLE t(k INT);\n-- note\nINSERT INTO t VALUES\n(1),\n(2);\nCHECKPOINT;\n"
+        self.assertEqual(
+            sql_statements(text),
+            ["CREATE TABLE t(k INT)", "INSERT INTO t VALUES\n(1),\n(2)", "CHECKPOINT"],
+        )
+        self.assertEqual(parse_duration("30m"), 1800.0)
+        self.assertEqual(parse_duration("2h"), 7200.0)
+        self.assertEqual(parse_duration("45"), 45.0)
