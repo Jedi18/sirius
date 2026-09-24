@@ -97,7 +97,7 @@ TEST_CASE_METHOD(IntegerAggregateFixture,
     "(2, -2147483648, 0), (2, 2147483647, 4294967295),"
     "(2, NULL, NULL), (3, NULL, NULL)");
   run_ok("CHECKPOINT");
-  compare_gpu_vs_cpu("SELECT AVG(s), AVG(u) FROM narrow_agg");
+  compare_gpu_vs_cpu("SELECT AVG(s), AVG(u), AVG(CAST(s AS BIGINT)) FROM narrow_agg");
   compare_gpu_vs_cpu("SELECT g, AVG(s), AVG(u) FROM narrow_agg GROUP BY g");
   compare_gpu_vs_cpu("SELECT AVG(s), AVG(u) FROM narrow_agg WHERE g = 3");
   auto result = con->Query("SELECT AVG(s), AVG(u) FROM narrow_agg");

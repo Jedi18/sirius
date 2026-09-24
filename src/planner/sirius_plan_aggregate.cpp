@@ -688,14 +688,16 @@ static void prepare_integer_aggregates(duckdb::ClientContext& context, duckdb::L
           "Integer SUM requires a proven INT64 accumulator (falling back to CPU)");
       }
       if (name == "avg" && integer_input) {
-        // DuckDB may widen unsigned narrow arguments to BIGINT during binding.
+        // DuckDB may widen narrow arguments to BIGINT during binding (and
+        // SQL can request the same value-preserving widening explicitly).
         // Retain the bound expression, but recover its statically bounded domain.
         if (input_id == LogicalTypeId::BIGINT &&
             child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
           auto const& cast     = child->Cast<duckdb::BoundCastExpression>();
           auto const source_id = cast.child->return_type.id();
-          if (source_id == LogicalTypeId::UTINYINT || source_id == LogicalTypeId::USMALLINT ||
-              source_id == LogicalTypeId::UINTEGER) {
+          if (source_id == LogicalTypeId::TINYINT || source_id == LogicalTypeId::SMALLINT ||
+              source_id == LogicalTypeId::INTEGER || source_id == LogicalTypeId::UTINYINT ||
+              source_id == LogicalTypeId::USMALLINT || source_id == LogicalTypeId::UINTEGER) {
             input_id = source_id;
           }
         }
