@@ -406,6 +406,46 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
       cudaSuccess);
     return col;
   };
+  // Also verify the local reduction writes a DECIMAL128 partial and declares
+  // the same schema, so no information is lost before the merge tests below.
+  {
+    const std::vector<__int128_t> values{partial, partial};
+    auto column = cudf::make_fixed_point_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, 0}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(column->mutable_view().data<__int128_t>(),
+                       values.data(),
+                       values.size() * sizeof(__int128_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    auto input = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                         *space,
+                                         stream,
+                                         sirius::telemetry::batch_telemetry_info{});
+    duckdb::vector<duckdb::unique_ptr<Expression>> arguments;
+    arguments.push_back(make_uniq<BoundReferenceExpression>(decimal_type, 0));
+    duckdb::vector<duckdb::unique_ptr<Expression>> expressions;
+    expressions.push_back(make_uniq<BoundAggregateExpression>(
+      MakeDummyAggregate("avg", {decimal_type}, LogicalType::DOUBLE),
+      std::move(arguments),
+      nullptr,
+      nullptr,
+      AggregateType::NON_DISTINCT));
+    sirius_physical_ungrouped_aggregate local(
+      sirius::from_duckdb_vec(duckdb::vector<LogicalType>{LogicalType::DOUBLE}),
+      translate_expressions(std::move(expressions)),
+      2,
+      TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+    REQUIRE(sirius::to_duckdb(local.get_local_output_types()[0]) == decimal_type);
+    auto result = local.execute(pipelineable_operator_data({input}), stream);
+    auto const& batches =
+      dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches();
+    REQUIRE(batches.size() == 1);
+    auto view = sirius::get_cudf_table_view(*batches[0]);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::DECIMAL128);
+    REQUIRE(copy_column_to_host<__int128_t>(view.column(0))[0] == 2 * partial);
+    REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] == 2);
+  }
   for (bool grouped : {false, true}) {
     INFO("grouped=" << grouped);
     duckdb::vector<duckdb::unique_ptr<Expression>> expressions;
