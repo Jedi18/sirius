@@ -46,6 +46,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
@@ -981,11 +982,15 @@ TEST_CASE("translator: IN operator", "[expression_translator]")
 
 TEST_CASE("translator: IN NULL uses three-valued OR", "[expression_translator][in_null]")
 {
-  auto table = make_int32_table({2, 3});
+  auto columns = make_int32x2_table({2, 3}, {0, 0})->release();
+  columns[1]->set_null_mask(cudf::create_null_mask(2, cudf::mask_state::ALL_NULL, stream, mr), 2);
+  auto table = std::make_unique<cudf::table>(std::move(columns));
   for (bool negated : {false, true}) {
     for (bool null_first : {false, true}) {
       std::vector<std::unique_ptr<ast_node>> values;
-      auto null = make_null_const(logical_type::make(type_id::INTEGER));
+      // NULL literals are intentionally unsupported by this translator. A
+      // nullable column exercises the same UNKNOWN equality in a supported AST.
+      auto null = make_ref(1);
       if (null_first) { values.push_back(std::move(null)); }
       values.push_back(make_int_const(2));
       if (!null_first) { values.push_back(std::move(null)); }
