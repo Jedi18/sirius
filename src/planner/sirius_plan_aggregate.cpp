@@ -23,6 +23,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -660,18 +661,73 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-/// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
-/// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type.
-static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
-                                   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
+// cuDF integer SUM uses a 64-bit carrier in both local and merge aggregation.
+// A fitting final sum is insufficient: every partial sum must fit as well.
+// DuckDB's sum_no_overflow proves this using min/max * maximum cardinality,
+// separately bounding positive and negative totals, so arbitrary GPU partitions
+// and merge orders preserve that proof. Estimated cardinality is not a bound.
+static void prepare_integer_aggregates(duckdb::ClientContext& context, duckdb::LogicalAggregate& op)
 {
-  for (auto& type : types) {
-    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+  using duckdb::LogicalType;
+  using duckdb::LogicalTypeId;
+  for (auto const& group : op.groups) {
+    if (group->return_type.id() == LogicalTypeId::HUGEINT ||
+        group->return_type.id() == LogicalTypeId::UHUGEINT) {
+      throw duckdb::NotImplementedException("Wide integer GROUP BY requires CPU execution");
+    }
   }
-  for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
+  for (size_t i = 0; i < op.expressions.size(); ++i) {
+    auto& aggregate  = op.expressions[i]->Cast<duckdb::BoundAggregateExpression>();
+    auto const& name = aggregate.function.name;
+    if (!aggregate.children.empty()) {
+      auto& child              = aggregate.children[0];
+      auto input_id            = child->return_type.id();
+      auto const integer_input = child->return_type.IsIntegral();
+      if (name == "sum" && integer_input) {
+        throw duckdb::NotImplementedException(
+          "Integer SUM requires a proven INT64 accumulator (falling back to CPU)");
+      }
+      if (name == "avg" && integer_input) {
+        // DuckDB may widen unsigned narrow arguments to BIGINT during binding.
+        // Retain the bound expression, but recover its statically bounded domain.
+        if (input_id == LogicalTypeId::BIGINT &&
+            child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+          auto const& cast     = child->Cast<duckdb::BoundCastExpression>();
+          auto const source_id = cast.child->return_type.id();
+          if (source_id == LogicalTypeId::UTINYINT || source_id == LogicalTypeId::USMALLINT ||
+              source_id == LogicalTypeId::UINTEGER) {
+            input_id = source_id;
+          }
+        }
+        switch (input_id) {
+          case LogicalTypeId::TINYINT:
+          case LogicalTypeId::SMALLINT:
+          case LogicalTypeId::INTEGER:
+          case LogicalTypeId::UTINYINT:
+          case LogicalTypeId::USMALLINT:
+          case LogicalTypeId::UINTEGER:
+            // max(|input|) * UINT64_MAX < 2^96 < 10^38. DECIMAL128(scale=0)
+            // therefore holds every local/merged sum exactly, including cancellation.
+            // Only final AVG division converts to DOUBLE. This is a physical
+            // accumulator choice; AVG's logical result type remains unchanged.
+            child = duckdb::BoundCastExpression::AddCastToType(
+              context, std::move(child), LogicalType::DECIMAL(38, 0));
+            break;
+          default:
+            throw duckdb::NotImplementedException(
+              "Integer AVG requires an exact wide accumulator (falling back to CPU)");
+        }
+      }
+    }
+    if (aggregate.return_type == LogicalType::HUGEINT) {
+      if (name != "sum_no_overflow") {
+        throw duckdb::NotImplementedException(
+          "Wide integer aggregate result requires CPU execution");
+      }
+      // This is the sole proven HUGEINT result alias; do not narrow group keys
+      // or arbitrary wide integer results. DuckDB retains the SQL result type.
+      aggregate.return_type          = LogicalType::BIGINT;
+      op.types[op.groups.size() + i] = LogicalType::BIGINT;
     }
   }
 }
@@ -683,8 +739,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
 
-  // Downcast HUGEINT to BIGINT since cuDF does not support int128
-  downcast_hugeint_types(op.types, op.expressions);
+  // Validate accumulator domains before any child plan or expression is rewritten.
+  prepare_integer_aggregates(context, op);
 
   // Reject nested GROUP BY keys before extract_aggregate_expressions rewrites
   // groups into bare references (which lose the name needed for the error).

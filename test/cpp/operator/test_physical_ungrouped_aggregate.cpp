@@ -23,6 +23,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
+#include <op/sirius_physical_grouped_aggregate_merge.hpp>
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
@@ -370,5 +371,91 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     }
     double expected_avg = expected_sum / static_cast<double>(vals.size());
     REQUIRE(avg_out[0] == Approx(expected_avg));
+  }
+}
+
+// Use synthetic local partials to exercise the >INT64 merge domain without
+// materializing billions of INT32 rows. Each partial is an exact sum of n
+// copies of +/- INT32_MAX, the narrow-integer AVG planner's supported domain.
+TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
+          "[physical_ungrouped_aggregate][integer_aggregate]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto stream              = default_stream();
+  auto mr                  = get_resource_ref(*space);
+  auto decimal_type        = LogicalType::DECIMAL(38, 0);
+  constexpr int64_t n      = int64_t{1} << 33;
+  constexpr int64_t value  = 2147483647;
+  const __int128_t partial = static_cast<__int128_t>(n) * value;
+
+  auto decimal_column = [&](const __int128_t v) {
+    auto col = cudf::make_fixed_point_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, 0}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(
+      cudaMemcpy(col->mutable_view().data<__int128_t>(), &v, sizeof(v), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    return col;
+  };
+  auto int_column = [&](int64_t v) {
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT64}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(
+      cudaMemcpy(col->mutable_view().data<int64_t>(), &v, sizeof(v), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    return col;
+  };
+  for (bool grouped : {false, true}) {
+    INFO("grouped=" << grouped);
+    duckdb::vector<duckdb::unique_ptr<Expression>> expressions;
+    duckdb::vector<duckdb::unique_ptr<Expression>> arguments;
+    arguments.push_back(make_uniq<BoundReferenceExpression>(decimal_type, grouped ? 1 : 0));
+    expressions.push_back(make_uniq<BoundAggregateExpression>(
+      MakeDummyAggregate("avg", {decimal_type}, LogicalType::DOUBLE),
+      std::move(arguments),
+      nullptr,
+      nullptr,
+      AggregateType::NON_DISTINCT));
+
+    std::vector<std::shared_ptr<data_batch>> partials;
+    for (int sign : {1, 1, -1}) {
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      if (grouped) { columns.push_back(int_column(7)); }
+      columns.push_back(decimal_column(sign * partial));
+      columns.push_back(int_column(n));
+      partials.push_back(sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                                 *space,
+                                                 stream,
+                                                 sirius::telemetry::batch_telemetry_info{}));
+    }
+    REQUIRE(partials.size() == 3);
+    std::unique_ptr<operator_data> result;
+    if (grouped) {
+      duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+      BoundReferenceExpression key(LogicalType::BIGINT, 0);
+      groups.push_back(sirius::ast::from_duckdb(key));
+      sirius_physical_grouped_aggregate_merge merger(
+        sirius::from_duckdb_vec(
+          duckdb::vector<LogicalType>{LogicalType::BIGINT, LogicalType::DOUBLE}),
+        translate_expressions(std::move(expressions)),
+        std::move(groups),
+        1);
+      result = merger.execute(pipelineable_operator_data(partials), stream);
+    } else {
+      sirius_physical_ungrouped_aggregate_merge merger(
+        sirius::from_duckdb_vec(duckdb::vector<LogicalType>{LogicalType::DOUBLE}),
+        translate_expressions(std::move(expressions)),
+        1,
+        TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+      result = merger.execute(pipelineable_operator_data(partials), stream);
+    }
+    auto const& batches =
+      dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches();
+    REQUIRE(batches.size() == 1);
+    auto view = sirius::get_cudf_table_view(*batches[0]);
+    REQUIRE(view.num_rows() == 1);
+    auto averages = copy_column_to_host<double>(view.column(grouped ? 1 : 0));
+    REQUIRE(averages[0] == Approx(static_cast<double>(value) / 3));
   }
 }

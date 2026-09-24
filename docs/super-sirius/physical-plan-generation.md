@@ -60,7 +60,7 @@ Before either is chosen, `materialize_expression_join_keys()` pushes a projectio
 - **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
-- **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
+- **Integer aggregate carriers** — integer SUM requires DuckDB's `sum_no_overflow` proof before using an INT64 local/merge carrier; other integer SUMs fall back at planning. Integer AVG with a statically bounded 8/16/32-bit operand uses exact DECIMAL(38,0) local/merge sums and retains its DOUBLE result. BIGINT/UBIGINT/HUGEINT AVG falls back. Only proven SUM results receive the internal HUGEINT-to-BIGINT alias; group keys and arbitrary wide results are never narrowed.
 - **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
 
 ### Filter Pushdown

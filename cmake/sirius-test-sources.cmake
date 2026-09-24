@@ -51,6 +51,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_compressed_materialization_gate.cpp
     test/cpp/integration/test_compressed_materialization_partition.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
+    test/cpp/integration/test_gpu_execution_integer_aggregate.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
