@@ -737,7 +737,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::EQUAL, *probe_expr, *value_expr);
     comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+      cudf::ast::ast_operator::NULL_LOGICAL_OR, comparison_expr, next_comparison_expr);
   }
 
   if (!alt.negated) { return comparison_expr; }

@@ -1979,6 +1979,68 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
   }
 }
 
+// Exercise the native AST directly so singleton/all-NULL lists cannot be folded
+// away by DuckDB before they reach the evaluator.
+TEMPLATE_TEST_CASE("IN NULL lists preserve three-valued results",
+                   "[expression_evaluator][in_null]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input         = make_int32_batch_with_nulls(*space, {2, 3, 0, 2}, {true, true, false, true});
+  auto const integer = logical_type::make(type_id::INTEGER);
+  std::vector<std::vector<std::optional<int32_t>>> const lists = {{std::nullopt, 2},
+                                                                  {2, std::nullopt, 2},
+                                                                  {2, std::nullopt},
+                                                                  {std::nullopt, std::nullopt},
+                                                                  {std::nullopt},
+                                                                  {2},
+                                                                  {2, 2}};
+  for (auto const& list : lists) {
+    for (bool negated : {false, true}) {
+      INFO("size=" << list.size() << " negated=" << negated);
+      {
+        std::vector<std::unique_ptr<ast_node>> values;
+        bool has_null  = false;
+        bool has_match = false;
+        for (auto value : list) {
+          has_null |= !value.has_value();
+          has_match |= value.has_value();
+          values.push_back(value ? make_int_const(*value) : make_null_const(integer));
+        }
+        auto expr = make_in(make_ref(0), std::move(values), negated);
+        auto [in_batch, out_batch, iv, ov] =
+          run_execute(*space, input, one(std::move(expr)), TestType::value);
+        auto const valids = copy_valids_to_host(ov.column(0));
+        auto const result = copy_bool_column_to_host(ov.column(0));
+        REQUIRE(valids == std::vector<bool>{has_match, !has_null, false, has_match});
+        for (std::size_t row : {0U, 3U}) {
+          if (valids[row]) { REQUIRE(result[row] == static_cast<uint8_t>(!negated)); }
+        }
+        if (valids[1]) { REQUIRE(result[1] == static_cast<uint8_t>(negated)); }
+      }
+    }
+  }
+
+  // Mixed scalar/column lists must follow the same validity-aware OR path.
+  for (bool negated : {false, true}) {
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_null_const(integer));
+    values.push_back(make_ref(0));
+    values.push_back(make_int_const(9));
+    auto expr = make_in(make_ref(0), std::move(values), negated);
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(std::move(expr)), TestType::value);
+    REQUIRE(copy_valids_to_host(ov.column(0)) == std::vector<bool>{true, true, false, true});
+    auto const result = copy_bool_column_to_host(ov.column(0));
+    for (std::size_t row : {0U, 1U, 3U}) {
+      REQUIRE(result[row] == static_cast<uint8_t>(!negated));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // IS NULL / IS NOT NULL / NOT (operator expressions)
 // ---------------------------------------------------------------------------

@@ -357,7 +357,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
       expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
       comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+        cudf::ast::ast_operator::NULL_LOGICAL_OR, comparison_expr, next_comparison_expr);
       output = evaluate_result(compose(comparison_expr, {&output, &next_comparator}));
     }
 
@@ -398,12 +398,17 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   auto test = evaluate(*alt.probe, evaluation_mode::MATERIALIZE);
   D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
 
-  // Optimization: special handling when every haystack entry is a constant.
-  auto const all_constants = std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
-    return v && v->template holds<sirius::ast::constant>();
-  });
+  // The contains helpers decode non-NULL payloads directly. NULL-containing lists
+  // use the equality chain below, where TRUE wins over UNKNOWN and a nonmatch
+  // remains UNKNOWN. This also handles an all-NULL list without a special case.
+  auto const all_non_null_constants =
+    std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
+      return v && v->template holds<sirius::ast::constant>() &&
+             !std::holds_alternative<sirius::null_value>(
+               v->template get<sirius::ast::constant>().payload);
+    });
 
-  if (all_constants) {
+  if (all_non_null_constants) {
     std::unique_ptr<cudf::column> contains_column;
     switch (test.get_column_view().type().id()) {
       case cudf::type_id::INT8:
@@ -493,32 +498,36 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
     return evaluate_result(std::move(contains_column));
   }
 
-  // Some haystack referent is not a scalar — fall back to a chained OR of EQUAL comparisons.
+  // Nullable constants and nonconstant entries share SQL three-valued equality/OR.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
-  auto comparator        = evaluate(*alt.values[0], evaluation_mode::MATERIALIZE);
-  auto comparison_column = cudf::binary_operation(test.get_column_view(),
-                                                  comparator.get_column_view(),
-                                                  cudf::binary_operator::EQUAL,
-                                                  output_type,
-                                                  _stream,
-                                                  _mr);
-  auto output            = evaluate_result(std::move(comparison_column));
+  auto compare           = [&](sirius::ast::node const& value) {
+    auto comparator = evaluate(value, evaluation_mode::MATERIALIZE);
+    if (comparator.is_scalar()) {
+      return cudf::binary_operation(test.get_column_view(),
+                                    comparator.get_scalar(),
+                                    cudf::binary_operator::EQUAL,
+                                    output_type,
+                                    _stream,
+                                    _mr);
+    }
+    return cudf::binary_operation(test.get_column_view(),
+                                  comparator.get_column_view(),
+                                  cudf::binary_operator::EQUAL,
+                                  output_type,
+                                  _stream,
+                                  _mr);
+  };
+  auto output = evaluate_result(compare(*alt.values[0]));
 
   for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
-    auto next_comparator = evaluate(*alt.values[value_idx], evaluation_mode::MATERIALIZE);
-    auto next_eq_column  = cudf::binary_operation(test.get_column_view(),
-                                                 next_comparator.get_column_view(),
-                                                 cudf::binary_operator::EQUAL,
-                                                 output_type,
-                                                 _stream,
-                                                 _mr);
-    auto combined        = cudf::binary_operation(output.get_column_view(),
+    auto next_eq_column = compare(*alt.values[value_idx]);
+    auto combined       = cudf::binary_operation(output.get_column_view(),
                                            next_eq_column->view(),
-                                           cudf::binary_operator::LOGICAL_OR,
+                                           cudf::binary_operator::NULL_LOGICAL_OR,
                                            output_type,
                                            _stream,
                                            _mr);
-    output               = evaluate_result(std::move(combined));
+    output              = evaluate_result(std::move(combined));
   }
 
   if (!alt.negated) { return output; }

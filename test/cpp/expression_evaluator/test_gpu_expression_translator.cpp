@@ -979,6 +979,27 @@ TEST_CASE("translator: IN operator", "[expression_translator]")
   REQUIRE(host_vals == expected);
 }
 
+TEST_CASE("translator: IN NULL uses three-valued OR", "[expression_translator][in_null]")
+{
+  auto table = make_int32_table({2, 3});
+  for (bool negated : {false, true}) {
+    for (bool null_first : {false, true}) {
+      std::vector<std::unique_ptr<ast_node>> values;
+      auto null = make_null_const(logical_type::make(type_id::INTEGER));
+      if (null_first) { values.push_back(std::move(null)); }
+      values.push_back(make_int_const(2));
+      if (!null_first) { values.push_back(std::move(null)); }
+      auto expr       = make_in(make_ref(0), std::move(values), negated);
+      auto translator = make_translator();
+      auto tree       = translate(translator, *expr);
+      REQUIRE(tree.has_value());
+      auto result = cudf::compute_column(table->view(), tree->back(), stream, mr);
+      REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, false});
+      REQUIRE(copy_bool_column_to_host(result->view())[0] == static_cast<uint8_t>(!negated));
+    }
+  }
+}
+
 TEST_CASE("translator: NOT IN operator", "[expression_translator]")
 {
   std::vector<int32_t> values = {1, 2, 3, 4, 5};

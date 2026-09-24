@@ -226,3 +226,56 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id, month(dt) AS r FROM nt");
   compare_gpu_vs_cpu("SELECT id, day(dt) AS r FROM nt");
 }
+
+// Checkpointed table inputs prevent a constant SELECT from bypassing the GPU.
+TEST_CASE_METHOD(NullDataFixture,
+                 "gpu_execution IN NULL lists across evaluator strategies",
+                 "[integration][gpu_execution][in_null]")
+{
+  // Keep singleton/all-NULL predicates from being folded into EMPTY_RESULT so
+  // the route assertion still checks the evaluator rather than constant folding.
+  run_ok(
+    "SET disabled_optimizers='in_clause,compressed_materialization,late_materialization,"
+    "expression_rewriter'");
+  for (auto const* strategy : {"ast_interpret", "ast_jit", "materialize"}) {
+    DYNAMIC_SECTION(strategy)
+    {
+      run_ok(std::string("SET expression_evaluator_strategy='") + strategy + "'");
+      run_ok("CREATE TABLE in_decimal(id INTEGER, x DECIMAL(12,2), y DECIMAL(12,2))");
+      run_ok(
+        "INSERT INTO in_decimal VALUES (1,2.25,2.25),(2,8.50,NULL),"
+        "(3,NULL,2.25),(4,547801.64,0),(5,-195383.07,-195383.07),(6,2.25,2.25)");
+      run_ok("CHECKPOINT");
+      for (std::string const list : {"NULL,2.25,547801.64,-195383.07",
+                                     "2.25,NULL,547801.64,-195383.07",
+                                     "2.25,547801.64,-195383.07,NULL",
+                                     "NULL,NULL",
+                                     "NULL",
+                                     "2.25",
+                                     "2.25,2.25",
+                                     "NULL,y,2.25",
+                                     "y,NULL"}) {
+        for (std::string const op : {" IN ", " NOT IN "}) {
+          auto const predicate = "x" + op + "(" + list + ")";
+          INFO(predicate);
+          compare_gpu_vs_cpu("SELECT id," + predicate + " AS p FROM in_decimal");
+          compare_gpu_vs_cpu("SELECT id,CASE WHEN " + predicate +
+                             " THEN 1 ELSE 0 END AS p FROM in_decimal");
+          compare_gpu_vs_cpu("SELECT id FROM in_decimal WHERE " + predicate);
+        }
+      }
+      for (auto const& [column, value] :
+           std::vector<std::pair<std::string, std::string>>{{"i", "10"},
+                                                            {"b", "100"},
+                                                            {"dec", "10.50"},
+                                                            {"dbl", "1.5"},
+                                                            {"s", "'apple'"},
+                                                            {"dt", "DATE '2021-01-15'"}}) {
+        for (std::string const op : {" IN ", " NOT IN "}) {
+          compare_gpu_vs_cpu("SELECT id," + column + op + "(NULL," + value + ")," + column + op +
+                             "(" + value + ",NULL) FROM nt");
+        }
+      }
+    }
+  }
+}
