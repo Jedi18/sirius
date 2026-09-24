@@ -140,6 +140,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   auto output_view = sirius::get_cudf_table_view(
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(output_view.num_columns() == 6);  // 1 group + 3 non-avg + 2 (sum+count for avg)
+  REQUIRE(output_view.column(5).type().id() == cudf::type_id::UINT64);
 }
 
 TEMPLATE_TEST_CASE(

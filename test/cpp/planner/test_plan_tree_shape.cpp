@@ -119,6 +119,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
   // Keep STATISTICS_PROPAGATION disabled only for this shape-sensitive suite:
   // disabling it lets the deliminator retain the DELIM_JOINs asserted below.
+  // SUM topology controls therefore use DECIMAL: unproven integer SUM must reject.
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   disabled.insert(OptimizerType::STATISTICS_PROPAGATION);
@@ -883,7 +884,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET and wires only
   // through opaque-build evidence, while the flat side wires an ordinary scan-route endpoint.
   const std::string delim_query =
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "SELECT SUM(CAST(i.qty AS DECIMAL(38,0))) FROM items i, parts p WHERE p.pk = i.fk AND p.pname "
+    "= 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
 
   SECTION("delim-scan build, filter on: the scan route binds inside the delim internals")
@@ -981,9 +983,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
   }
 
+  SECTION("integer SUM without statistics has no safe accumulator proof")
+  {
+    REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT sum(val) FROM big_left"),
+                        Catch::Contains("Integer SUM requires a proven INT64 accumulator"));
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
-    auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
+    auto plan = generate_sirius_plan(*con, "SELECT sum(CAST(val AS DECIMAL(38,0))) FROM big_left");
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -1005,8 +1013,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     duckdb::vector<sirius::logical_type> const expected_local_types{
-      sirius::logical_type::make(sirius::type_id::BIGINT),
-      sirius::logical_type::make(sirius::type_id::BIGINT)};
+      sirius::logical_type::make_decimal(38, 0),
+      sirius::logical_type::make(sirius::type_id::UBIGINT)};
     CHECK(local->get_types() == expected_local_types);
   }
 
@@ -1024,7 +1032,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     REQUIRE(local->get_types().size() == 2);
     CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
-    CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
+    CHECK(local->get_types()[1].id() == sirius::type_id::UBIGINT);
   }
 }
 
@@ -1068,10 +1076,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("RIGHT_DELIM_JOIN: partition_join points at the build-side PARTITION")
   {
     // TPC-H q17 shape: correlated aggregate whose outer is a filtered join.
-    auto plan = generate_sirius_plan(
-      *con,
-      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT SUM(CAST(i.qty AS DECIMAL(38,0))) FROM items i, parts p WHERE "
+                           "p.pk = i.fk AND p.pname = 'p1' "
+                           "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
     INFO(tree_to_string(plan.get()));
 
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
@@ -1126,7 +1135,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "SELECT val, count(*) FROM big_left GROUP BY val ORDER BY val",
     // RIGHT and LEFT delim joins: parent stamping must descend into the internal
     // `join`/`distinct_root` subtrees.
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "SELECT SUM(CAST(i.qty AS DECIMAL(38,0))) FROM items i, parts p WHERE p.pk = i.fk AND p.pname "
+    "= 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)",
     "SELECT l.id FROM big_left l "
     "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)",
@@ -1457,10 +1467,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   //
   // Cross-check planner::collect_gpu_scans against this suite's independently written
   // for_each_operator: the two descend the tree separately and must agree.
-  auto plan = generate_sirius_plan(
-    *con,
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT SUM(CAST(i.qty AS DECIMAL(38,0))) FROM items i, parts p WHERE "
+                         "p.pk = i.fk AND p.pname = 'p1' "
+                         "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
   INFO(tree_to_string(plan.get()));
 
   REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
