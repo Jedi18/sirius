@@ -138,13 +138,17 @@ TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution ungrouped aggregates over a wholly-NULL column",
                  "[integration][gpu_execution][aggregate][nulls]")
 {
-  compare_gpu_vs_cpu(
+  // DuckDB leaves SUM as an unproven wide aggregate when all values are NULL.
+  // Its semantics remain supported through intentional plan-time fallback.
+  expect_plan_fallback_matches_cpu(
     "SELECT SUM(allnull), AVG(allnull), MIN(allnull), MAX(allnull), COUNT(allnull) FROM agg_n");
+  compare_gpu_vs_cpu("SELECT AVG(allnull), MIN(allnull), MAX(allnull), COUNT(allnull) FROM agg_n");
 }
 
 TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution grouped aggregates over a wholly-NULL column",
                  "[integration][gpu_execution][aggregate][nulls]")
 {
-  compare_gpu_vs_cpu("SELECT g, SUM(allnull), COUNT(allnull) FROM agg_n GROUP BY g");
+  expect_plan_fallback_matches_cpu("SELECT g, SUM(allnull), COUNT(allnull) FROM agg_n GROUP BY g");
+  compare_gpu_vs_cpu("SELECT g, AVG(allnull), COUNT(allnull) FROM agg_n GROUP BY g");
 }
