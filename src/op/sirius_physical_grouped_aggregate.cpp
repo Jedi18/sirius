@@ -22,6 +22,9 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/table/table.hpp>
+#include <cudf/unary.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -107,6 +110,25 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               stream,
                                                               *space,
                                                               batch_telemetry());
+    if (has_avg) {
+      // COUNT_VALID is small locally, but AVG's total count has DuckDB's
+      // uint64_t domain. Widen only AVG denominators before any partial merge;
+      // ordinary COUNT retains its existing signed SQL result representation.
+      auto mutable_result  = result->to_mutable();
+      auto& representation = mutable_result.get_data()->cast<cucascade::gpu_table_representation>();
+      auto columns         = representation.release_table(stream)->release();
+      for (auto const& slot : aggregate_slots) {
+        if (!slot.is_avg) { continue; }
+        auto const count_index = group_idx.size() + slot.cudf_idx + 1;
+        columns[count_index]   = cudf::cast(columns[count_index]->view(),
+                                          cudf::data_type{cudf::type_id::UINT64},
+                                          stream,
+                                          space->get_default_allocator());
+      }
+      auto table = std::make_unique<cudf::table>(std::move(columns));
+      mutable_result.set_data(
+        std::make_unique<cucascade::gpu_table_representation>(std::move(table), *space, stream));
+    }
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

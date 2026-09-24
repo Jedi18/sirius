@@ -377,6 +377,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
 // Use synthetic local partials to exercise the >INT64 merge domain without
 // materializing billions of INT32 rows. Each partial is an exact sum of n
 // copies of +/- INT32_MAX, the narrow-integer AVG planner's supported domain.
+// The total count also exceeds INT64, exercising the unsigned denominator.
 TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
           "[physical_ungrouped_aggregate][integer_aggregate]")
 {
@@ -386,7 +387,7 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
   auto stream              = default_stream();
   auto mr                  = get_resource_ref(*space);
   auto decimal_type        = LogicalType::DECIMAL(38, 0);
-  constexpr int64_t n      = int64_t{1} << 33;
+  constexpr int64_t n      = int64_t{1} << 62;
   constexpr int64_t value  = 2147483647;
   const __int128_t partial = static_cast<__int128_t>(n) * value;
 
@@ -398,9 +399,9 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
       cudaSuccess);
     return col;
   };
-  auto int_column = [&](int64_t v) {
+  auto int_column = [&](int64_t v, cudf::type_id type = cudf::type_id::INT64) {
     auto col = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT64}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
+      cudf::data_type{type}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
     REQUIRE(
       cudaMemcpy(col->mutable_view().data<int64_t>(), &v, sizeof(v), cudaMemcpyHostToDevice) ==
       cudaSuccess);
@@ -444,7 +445,8 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
     auto view = sirius::get_cudf_table_view(*batches[0]);
     REQUIRE(view.column(0).type().id() == cudf::type_id::DECIMAL128);
     REQUIRE(copy_column_to_host<__int128_t>(view.column(0))[0] == 2 * partial);
-    REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] == 2);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::UINT64);
+    REQUIRE(copy_column_to_host<uint64_t>(view.column(1))[0] == 2);
   }
   for (bool grouped : {false, true}) {
     INFO("grouped=" << grouped);
@@ -463,7 +465,7 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
       std::vector<std::unique_ptr<cudf::column>> columns;
       if (grouped) { columns.push_back(int_column(7)); }
       columns.push_back(decimal_column(sign * partial));
-      columns.push_back(int_column(n));
+      columns.push_back(int_column(n, cudf::type_id::UINT64));
       partials.push_back(sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                                  *space,
                                                  stream,

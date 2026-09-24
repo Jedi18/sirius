@@ -211,7 +211,7 @@ aggregate_layout build_aggregate_layout(
         layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         layout.merge_nth_index.push_back(std::nullopt);
         spec.local_count_idx = local_idx++;
-        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.local_types.push_back(duckdb::LogicalType::UBIGINT);
         layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         layout.merge_nth_index.push_back(std::nullopt);
         layout.has_avg = true;
@@ -412,7 +412,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               count_scalar   = cudf::reduce(
                 col, *count_agg, cudf::data_type{cudf::type_id::INT64}, std::nullopt, stream);
             }
-            cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
+            // DuckDB AVG counts rows in uint64_t. A local batch fits INT64,
+            // but merging many partials must retain the full unsigned domain.
+            auto count_column = cudf::make_column_from_scalar(*count_scalar, 1, stream);
+            cols.push_back(
+              cudf::cast(count_column->view(), cudf::data_type{cudf::type_id::UINT64}, stream));
           }
           break;
         }
