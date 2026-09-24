@@ -121,6 +121,11 @@ TEST_CASE_METHOD(IntegerAggregateFixture,
   compare_gpu_vs_cpu(
     "SELECT g, SUM(s), SUM(b), COUNT(u), MIN(u), MAX(u) "
     "FROM safe_agg GROUP BY g");
+  auto result = con->Query("SELECT SUM(s), SUM(b) FROM safe_agg");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->types[0] == duckdb::LogicalType::HUGEINT);
+  REQUIRE(result->types[1] == duckdb::LogicalType::HUGEINT);
 }
 
 TEST_CASE_METHOD(IntegerAggregateFixture,
