@@ -647,6 +647,12 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::cast const& alt, cudf::ast::table_reference const table_src)
 {
+  // Standalone cuDF ASTs cannot express checked decimal rounding. Decline pushdown/join
+  // translation so callers use the evaluator (or their configured CPU fallback).
+  if (alt.kind == sirius::ast::cast_kind::semantic && alt.child->return_type().is_decimal() &&
+      alt.target_type.is_integer()) {
+    return std::nullopt;
+  }
   // Add the child
   auto child_expr = add_expression(*alt.child, table_src);
 

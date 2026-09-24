@@ -87,6 +87,10 @@ std::size_t between::cudf_ast_op_count() const
 
 std::size_t cast::cudf_ast_op_count() const
 {
+  if (kind == cast_kind::semantic && child->return_type().is_decimal() &&
+      target_type.is_integer()) {
+    return 0;
+  }
   // Only target types in supported_ast_cast_types_native lower to a single
   // CAST_TO_* cuDF AST op; others force materialize.
   bool const supported = std::find(supported_ast_cast_types_native.begin(),

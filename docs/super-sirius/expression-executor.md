@@ -155,6 +155,15 @@ The following translate directly into cuDF AST nodes:
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
+Semantic DECIMAL-to-integer casts are also AST breakers, including BIGINT and UBIGINT targets.
+The evaluator uses an integer-only CUDA conversion for DECIMAL32/64/128: round to nearest with
+halfway values away from zero, then check the destination range. NULLs propagate; overflow
+produces NULL for TRY_CAST and throws for CAST (the normal runtime fallback policy can then
+retry on DuckDB). Signed and unsigned 8–64-bit targets are supported. Decimal casts to
+HUGEINT/UHUGEINT are declined during planning because Sirius lacks full-width integer carriers.
+Standalone cuDF AST translation also declines decimal-to-integer semantic casts. Physical
+carrier-restoration casts continue to preserve the decimal scale and unscaled value.
+
 ## GPU Expression Translator
 
 **File:** `src/expression_evaluator/gpu_expression_translator_internal.hpp`

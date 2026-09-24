@@ -171,6 +171,13 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
   // then applies the configured fallback policy. Planner-generated restores bypass translation.
   auto const& source_type = expr.child->return_type;
   auto const& target_type = expr.return_type;
+  // Sirius currently maps HUGEINT carriers to 64 bits. Do not narrow a rounded decimal
+  // into that carrier: leave these two targets to DuckDB until full-width integers exist.
+  if (source_type.id() == duckdb::LogicalTypeId::DECIMAL &&
+      (target_type.id() == duckdb::LogicalTypeId::HUGEINT ||
+       target_type.id() == duckdb::LogicalTypeId::UHUGEINT)) {
+    return nullptr;
+  }
   if ((source_type.IsTemporal() && target_type.IsNumeric()) ||
       (source_type.IsNumeric() && target_type.IsTemporal())) {
     return nullptr;

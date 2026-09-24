@@ -40,6 +40,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
+    test/cpp/expression_evaluator/test_decimal_to_integer.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
@@ -54,6 +55,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
+    test/cpp/integration/test_gpu_execution_decimal_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp

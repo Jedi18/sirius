@@ -17,6 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/decimal_to_integer.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -58,11 +59,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
               supported_ast_cast_types_native.end(),
               alt.target_type.id()) != supported_ast_cast_types_native.end();
 
-  auto const ast_op_count = alt.cudf_ast_op_count();
+  auto const ast_op_count       = alt.cudf_ast_op_count();
+  auto const decimal_to_integer = alt.kind == sirius::ast::cast_kind::semantic &&
+                                  alt.child->return_type().is_decimal() &&
+                                  alt.target_type.is_integer();
+  if (decimal_to_integer &&
+      (alt.target_type.id() == type_id::HUGEINT || alt.target_type.id() == type_id::UHUGEINT)) {
+    throw not_implemented_exception("Decimal casts to 128-bit integers require CPU execution");
+  }
 
   // Carrier restores must reach the materialized branch, the only path authorized to use the
   // physical representation tunnel. Semantic casts may use the cuDF AST path.
-  if (ast_supported && alt.kind == sirius::ast::cast_kind::semantic &&
+  if (ast_supported && !decimal_to_integer && alt.kind == sirius::ast::cast_kind::semantic &&
       _strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child            = evaluate(*alt.child, evaluation_mode::AST);
@@ -88,10 +96,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
       cudf::make_column_from_scalar(child.get_scalar(), _input_table.num_rows(), _stream, _mr));
   }
   // Only planner-certified carrier restoration may tunnel through the narrowed representation.
-  // A semantic cast delegates to cuDF and is never reinterpreted as a physical DATE restore.
+  // Decimal-to-integer semantic casts need rounding and range checks that cuDF casts lack.
   auto result_column =
     alt.kind == sirius::ast::cast_kind::carrier_restore
       ? sirius::cast_through_rep(child.get_column_view(), return_type, _stream, _mr)
+    : decimal_to_integer
+      ? cast_decimal_to_integer(child.get_column_view(), return_type, alt.try_cast, _stream, _mr)
       : cudf::cast(child.get_column_view(), return_type, _stream, _mr);
   if (mode == evaluation_mode::AST) {
     // The parent is executing in AST mode, so add the materialized result to the AST tree.
