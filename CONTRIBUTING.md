@@ -32,6 +32,22 @@ make test
 
 Test logs are written to `build/release/extension/sirius/test/cpp/log/`.
 
+### On-demand SQL fuzzing
+
+The [Sirius fuzzer](test/fuzz/README.md) generates SQL and compares DuckDB CPU results
+with Sirius GPU execution. On a supported Linux GPU host, build the extension and the
+matching Python module, then check the environment before starting a campaign:
+
+```bash
+pixi run -e duckdb-python build-duckdb-python
+pixi run -e duckdb-python fuzz doctor
+pixi run -e duckdb-python fuzz run --seed 42 --queries 100 --duration 3m --no-reduce
+```
+
+The guide covers portable replay, bounded triage, intermediate reports and local issue
+drafts. The tool runs without an AI agent and publishes no issues. Harness unit tests
+run with `pixi run -e duckdb-python fuzz-test` and do not require a GPU.
+
 ## Code style
 
 Sirius uses pre-commit hooks for formatting and linting. Install them once after cloning:
