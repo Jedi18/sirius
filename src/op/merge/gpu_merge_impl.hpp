@@ -96,6 +96,7 @@ class gpu_merge_impl {
    * num input columns`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param wide_sum_indices Aggregate positions whose partial sums need a DECIMAL128 carrier.
    *
    * @return The output data batch.
    */
@@ -105,7 +106,8 @@ class gpu_merge_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    const std::vector<std::size_t>& wide_sum_indices      = {});
 
   /**
    * @brief Perform merge order-by on multiple data batches.

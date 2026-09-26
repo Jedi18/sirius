@@ -26,6 +26,9 @@
 #include <cudf/merge.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/unary.hpp>
+
+#include <algorithm>
 
 namespace sirius {
 namespace op {
@@ -159,7 +162,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cudf::aggregation::Kind>& aggregates,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::size_t>& wide_sum_indices)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -243,10 +247,19 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
   std::vector<cudf::groupby::aggregation_request> requests;
+  std::vector<std::unique_ptr<cudf::column>> wide_sum_columns;
+  wide_sum_columns.reserve(wide_sum_indices.size());
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);
     cudf::groupby::aggregation_request request;
     request.values = concatenated->get_column(aggregate_col_id).view();
+    if (std::find(wide_sum_indices.begin(), wide_sum_indices.end(), i) != wide_sum_indices.end()) {
+      // cuDF's grouped SUM uses a signed INT64 result for UINT64 inputs. AVG
+      // denominators can exceed INT64_MAX even when their UINT64 total is valid.
+      wide_sum_columns.push_back(
+        cudf::cast(request.values, cudf::data_type{cudf::type_id::DECIMAL128, 0}, stream, mr));
+      request.values = wide_sum_columns.back()->view();
+    }
     switch (aggregates[i]) {
       case cudf::aggregation::Kind::MIN: {
         request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());

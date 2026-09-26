@@ -23,6 +23,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
+#include <op/merge/gpu_merge_impl.hpp>
 #include <op/sirius_physical_grouped_aggregate_merge.hpp>
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
@@ -381,7 +382,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
 TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
           "[physical_ungrouped_aggregate][integer_aggregate]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
   REQUIRE(space);
   auto stream              = default_stream();
@@ -472,6 +473,24 @@ TEST_CASE("integer AVG decimal partials remain exact across multiple batches",
                                                  sirius::telemetry::batch_telemetry_info{}));
     }
     REQUIRE(partials.size() == 3);
+    if (grouped) {
+      std::vector<cucascade::read_only_data_batch> inputs;
+      for (auto const& batch : partials) {
+        inputs.push_back(batch->to_read_only());
+      }
+      auto merged = gpu_merge_impl::merge_grouped_aggregate(
+        inputs,
+        1,
+        {cudf::aggregation::Kind::SUM, cudf::aggregation::Kind::SUM},
+        stream,
+        *space,
+        sirius::telemetry::batch_telemetry_info{},
+        {1});
+      auto view = sirius::get_cudf_table_view(*merged);
+      REQUIRE(copy_column_to_host<__int128_t>(view.column(1))[0] == partial);
+      REQUIRE(view.column(2).type().id() == cudf::type_id::DECIMAL128);
+      REQUIRE(copy_column_to_host<__int128_t>(view.column(2))[0] == 3 * static_cast<__int128_t>(n));
+    }
     std::unique_ptr<operator_data> result;
     if (grouped) {
       duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;

@@ -223,12 +223,17 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
+    std::vector<std::size_t> wide_sum_indices;
+    for (auto const& slot : aggregate_slots) {
+      if (slot.is_avg) { wide_sum_indices.push_back(slot.cudf_idx + 1); }
+    }
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
-                                                     batch_telemetry());
+                                                     batch_telemetry(),
+                                                     wide_sum_indices);
   }
 
   // If no post-processing needed, return merged result directly
