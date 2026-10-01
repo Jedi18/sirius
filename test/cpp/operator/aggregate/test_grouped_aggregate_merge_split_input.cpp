@@ -129,9 +129,10 @@ TEST_CASE("merge split_input: pieces are key-disjoint and together hold every in
   CHECK(total_rows == static_cast<std::size_t>(3 * kKeys));
   CHECK(piece_of_key.size() == static_cast<std::size_t>(kKeys + 500));
   // Both pieces got a non-trivial share: murmur3 over 1500 keys does not pile up on one side.
+  auto const input_rows = static_cast<std::size_t>(3 * kKeys);
   for (std::size_t j = 0; j < pieces.size(); ++j) {
-    CHECK(rows_of(*pieces[j]) > 3 * kKeys / 4);
-    CHECK(rows_of(*pieces[j]) < 3 * kKeys - 3 * kKeys / 4);
+    CHECK(rows_of(*pieces[j]) > input_rows / 4);
+    CHECK(rows_of(*pieces[j]) < input_rows - input_rows / 4);
   }
 }
 
