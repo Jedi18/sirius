@@ -438,6 +438,36 @@ TEST_CASE("OOM split: a depth cap of zero keeps the pre-existing plain retry pat
   CHECK(f.merge->executes.load() == 101);
 }
 
+TEST_CASE("OOM split: a never-fitting input at depth four terminates within the retry cap",
+          "[gpu_pipeline_executor][oom][oom_split][max_retries][depth_four]")
+{
+  split_fixture f;
+  if (!f.setup(/*split_after_retries=*/0, /*max_split_depth=*/4)) {
+    WARN("Skipping OOM split test — no GPU available.");
+    return;
+  }
+  f.merge->fail_above_rows = 0;
+  auto const started       = std::chrono::steady_clock::now();
+  f.schedule_merge_task(make_input(f));
+
+  REQUIRE(f.wait_for_outcome(std::chrono::seconds(180)));
+  REQUIRE(f.completion->has_error());
+  CHECK(f.sink->snapshot().empty());
+  auto const elapsed = std::chrono::steady_clock::now() - started;
+  CHECK(elapsed < std::chrono::seconds(120));
+
+  std::size_t smallest = kTotalRows;
+  {
+    std::lock_guard<std::mutex> lock(f.merge->rows_mutex);
+    for (auto rows : f.merge->rows_seen) {
+      smallest = std::min(smallest, rows);
+    }
+  }
+  CHECK(smallest > 0);
+  CHECK(smallest < kTotalRows / 8);  // reached smaller leaves than the depth-two test
+  CHECK(f.merge->executes.load() < 16 * 101 + 15);
+}
+
 TEST_CASE("OOM split: a single-key input cannot be split and falls back to plain retries",
           "[gpu_pipeline_executor][oom][oom_split][max_retries]")
 {

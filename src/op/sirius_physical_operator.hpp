@@ -284,6 +284,22 @@ class pipelineable_operator_data : public operator_data {
     _read_only_data_batches = std::nullopt;
   }
 
+  /** Transfer owned batches to an incremental split, releasing cached read locks first. */
+  std::vector<std::shared_ptr<::cucascade::data_batch>> take_batches_for_split()
+  {
+    remove_read_only_lock();
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.swap(_data_batches);
+    return batches;
+  }
+
+  /** Restore a row-complete input when a split fails. */
+  void restore_batches_after_split(std::vector<std::shared_ptr<::cucascade::data_batch>> batches)
+  {
+    remove_read_only_lock();
+    _data_batches = std::move(batches);
+  }
+
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
@@ -599,12 +615,12 @@ class sirius_physical_operator {
    * than two pieces means the input cannot be split further (a single row or a single key) and
    * the caller must stop asking. @p split_round counts the splits already applied to this input's
    * lineage; implementations hash with a round-dependent seed so a later split does not re-derive
-   * an earlier one's boundaries. Must leave @p input untouched when it throws, so an
-   * rmm::out_of_memory raised here can be retried with the original input.
+   * an earlier one's boundaries. On failure, the input must still contain every row so the split
+   * can be retried, though it may contain newly partitioned batches in place of consumed ones.
    *
    * The base implementation throws; override it together with supports_input_split().
    */
-  virtual std::vector<std::unique_ptr<operator_data>> split_input(const operator_data& input,
+  virtual std::vector<std::unique_ptr<operator_data>> split_input(operator_data& input,
                                                                   int num_pieces,
                                                                   uint32_t split_round,
                                                                   ::cuda::stream_ref stream);

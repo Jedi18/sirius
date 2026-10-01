@@ -455,7 +455,8 @@ task OOMs at operator i
   ├─ split_depth >= oom_split_max_depth, or a previous split found one key? → plain retry
   │
   └─ otherwise: reschedule ONE task with pending_split_pieces = 2 and no inherited retry floor
-       │  (its reservation is sized at 2x the input: it only hash-partitions, it never merges)
+       │  (its reservation is sized at 2x the input as a conservative bound; it only
+       │   hash-partitions, releasing each original batch after its pieces are ready)
        └─ gpu_pipeline_task::execute → prepare_for_processing → split_prepared_input:
             operators[i].split_input(input, 2, split_depth, stream)
               ├─ 1 piece (single key / single row) → split_exhausted = true, run unsplit
@@ -470,7 +471,8 @@ task OOMs at operator i
 when `execute()` over an input equals the row-wise union of `execute()` over a key-disjoint
 decomposition of it. `split_input()` must place every input row in exactly one piece, drop
 empty pieces, return fewer than two pieces when the input cannot be divided, and leave the input
-untouched if it throws (so an OOM *during* the split retries the split with the original input).
+row-complete if it throws (so an OOM *during* the split retries from the completed pieces plus
+the unsplit remainder). The input's batch layout can change across retries.
 `MERGE_GROUP_BY` is the only implementation today: it hash-partitions every input batch on the
 grouping keys with `gpu_partition_impl::resplit_hash_seed(split_round)` — never cuDF's default
 seed, which the plan-level PARTITION used, since re-hashing a `hash % P` slot with the same seed
@@ -490,10 +492,12 @@ decision itself (`decide_oom_recovery`) is a pure function covered by `[oom_spli
 executor path is exercised end to end in `test_oom_split_reschedule.cpp` with a merge that
 reports OOM above a row budget.
 
-**Memory.** The split task holds the input and all pieces at once (about 2x the input, plus
-cuDF's per-batch hash scratch) — far below a merge's concatenation + hash table + output, which
-is why pieces fit where the merge did not. Downgrade still applies: a rescheduled split task's
-input sits unlocked in the executor queue like any other rescheduled input.
+**Memory.** The split task releases each original batch after its pieces and the cuDF hash work
+for that batch complete. Its peak is the unsplit input plus output for one batch and that batch's
+hash scratch, rather than the whole input plus all pieces. The reservation request remains 2x
+the input as a conservative bound; a partial reservation can still succeed as processed batches
+free memory. Downgrade still applies: a rescheduled split task's input sits unlocked in the
+executor queue like any other rescheduled input.
 
 ## Error Handling and Draining
 

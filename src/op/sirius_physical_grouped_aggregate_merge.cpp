@@ -30,6 +30,8 @@
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
 
+#include <cuda_runtime.h>
+
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -205,14 +207,14 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
 }
 
 std::vector<std::unique_ptr<operator_data>> sirius_physical_grouped_aggregate_merge::split_input(
-  const operator_data& input_data, int num_pieces, uint32_t split_round, ::cuda::stream_ref stream)
+  operator_data& input_data, int num_pieces, uint32_t split_round, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::split_input"};
   if (num_pieces < 2) {
     throw std::invalid_argument("split_input: num_pieces must be at least 2, got " +
                                 std::to_string(num_pieces));
   }
-  auto const& input             = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto& input                   = dynamic_cast<pipelineable_operator_data&>(input_data);
   auto const* partitioned_input = dynamic_cast<const partitioned_operator_data*>(&input_data);
   // Rebuild each piece with the input's own shape: a partitioned input keeps its slot index so
   // the task creator / executor pin every piece to the GPU already holding the data.
@@ -230,11 +232,13 @@ std::vector<std::unique_ptr<operator_data>> sirius_physical_grouped_aggregate_me
   // Every merge input leads with its grouping keys (see get_output_grouping_indices). Without
   // keys every row is one group and nothing can be separated.
   std::vector<int> const keys = get_output_grouping_indices();
-  auto const ro_batches       = input.get_read_only_batches();
   std::uint64_t total_rows    = 0;
-  for (auto const& ro : ro_batches) {
-    if (ro.get_data()) {
-      total_rows += static_cast<std::uint64_t>(get_cudf_table_view(ro).num_rows());
+  {
+    auto const ro_batches = input.get_read_only_batches();
+    for (auto const& ro : ro_batches) {
+      if (ro.get_data()) {
+        total_rows += static_cast<std::uint64_t>(get_cudf_table_view(ro).num_rows());
+      }
     }
   }
   if (keys.empty() || total_rows < 2) {
@@ -247,28 +251,72 @@ std::vector<std::unique_ptr<operator_data>> sirius_physical_grouped_aggregate_me
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> piece_batches(
     static_cast<std::size_t>(num_pieces));
   std::vector<std::uint64_t> piece_rows(static_cast<std::size_t>(num_pieces), 0);
-  for (auto const& ro : ro_batches) {
-    if (!ro.get_data() || get_cudf_table_view(ro).num_rows() == 0) { continue; }
-    auto* space = ro.get_memory_space();
-    if (space == nullptr) {
-      throw std::runtime_error("split_input: input batch has no memory space");
+  auto batches           = input.take_batches_for_split();
+  auto const batch_count = batches.size();
+  std::size_t next_batch = 0;
+  // True once the current batch's pieces have been appended to `piece_batches`. From that point
+  // the batch itself must NOT be restored on failure, or its rows would appear twice (once in the
+  // pieces, once in the original) on the retry.
+  bool current_consumed = false;
+  try {
+    for (; next_batch < batches.size(); ++next_batch) {
+      if (!batches[next_batch]) { continue; }
+      current_consumed = false;
+      {
+        auto ro = batches[next_batch]->to_read_only();
+        if (ro.get_data() && get_cudf_table_view(ro).num_rows() != 0) {
+          auto* space = ro.get_memory_space();
+          if (space == nullptr) {
+            throw std::runtime_error("split_input: input batch has no memory space");
+          }
+          auto parts = gpu_partition_impl::hash_partition(ro,
+                                                          keys,
+                                                          /*partition_key_cast_types=*/{},
+                                                          num_pieces,
+                                                          stream,
+                                                          *space,
+                                                          batch_telemetry(),
+                                                          seed);
+          for (std::size_t j = 0; j < parts.size(); ++j) {
+            auto const rows = get_cudf_table_view(*parts[j]).num_rows();
+            // Empty pieces cost a lock and a copy but contribute no rows.
+            if (rows == 0) { continue; }
+            piece_rows[j] += static_cast<std::uint64_t>(rows);
+            piece_batches[j].push_back(std::move(parts[j]));
+          }
+          current_consumed = true;
+        }
+        // The hash and copies read this input batch asynchronously. Finish them before
+        // releasing its last owner so its GPU allocation can fund the next batch.
+        stream.sync();
+      }
+      batches[next_batch].reset();
     }
-    auto parts = gpu_partition_impl::hash_partition(ro,
-                                                    keys,
-                                                    /*partition_key_cast_types=*/{},
-                                                    num_pieces,
-                                                    stream,
-                                                    *space,
-                                                    batch_telemetry(),
-                                                    seed);
-    for (std::size_t j = 0; j < parts.size(); ++j) {
-      auto const rows = get_cudf_table_view(*parts[j]).num_rows();
-      // A piece that received nothing from this batch gets no batch at all: the merge expects
-      // at least one row-bearing batch, and an empty one would only cost a lock and a copy.
-      if (rows == 0) { continue; }
-      piece_rows[j] += static_cast<std::uint64_t>(rows);
-      piece_batches[j].push_back(std::move(parts[j]));
+  } catch (...) {
+    // A partial hash_partition may still have queued reads or writes. Once quiescent, all
+    // completed pieces plus the current and remaining original batches form the full input.
+    // Do not let a failing synchronize replace the exception in flight or skip the restore:
+    // an input left without its rows would retry as an empty merge.
+    (void)cudaStreamSynchronize(stream.get());
+    std::vector<std::shared_ptr<cucascade::data_batch>> restored;
+    restored.reserve(batch_count + static_cast<std::size_t>(num_pieces) * next_batch);
+    for (auto& group : piece_batches) {
+      for (auto& batch : group) {
+        restored.push_back(std::move(batch));
+      }
     }
+    for (; next_batch < batches.size(); ++next_batch) {
+      if (!batches[next_batch]) { continue; }
+      // The batch being processed is already represented by its pieces if they were appended;
+      // restoring it too would duplicate its rows.
+      if (current_consumed) {
+        current_consumed = false;
+        continue;
+      }
+      restored.push_back(std::move(batches[next_batch]));
+    }
+    input.restore_batches_after_split(std::move(restored));
+    throw;
   }
 
   std::vector<std::unique_ptr<operator_data>> pieces;
@@ -282,7 +330,7 @@ std::vector<std::unique_ptr<operator_data>> sirius_physical_grouped_aggregate_me
     "merge_group_by id {} split_input: {} batches / {} rows -> {} of {} requested pieces "
     "(rows per piece: {}) at split round {}",
     get_operator_id(),
-    ro_batches.size(),
+    batch_count,
     total_rows,
     pieces.size(),
     num_pieces,

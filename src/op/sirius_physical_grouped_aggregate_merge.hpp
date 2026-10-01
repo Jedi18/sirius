@@ -151,7 +151,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   //! with gpu_partition_impl::resplit_hash_seed(split_round), so a slot the upstream PARTITION
   //! already carved out divides evenly again. Zero-row pieces are dropped; the result keeps the
   //! input's partition index so every piece stays pinned to the GPU holding the data.
-  std::vector<std::unique_ptr<operator_data>> split_input(const operator_data& input,
+  std::vector<std::unique_ptr<operator_data>> split_input(operator_data& input,
                                                           int num_pieces,
                                                           uint32_t split_round,
                                                           ::cuda::stream_ref stream) override;

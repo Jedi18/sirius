@@ -876,8 +876,7 @@ void gpu_pipeline_task::split_prepared_input(gpu_pipeline_task_local_state& loca
     // before anything else may read, free or downgrade them.
     stream.sync();
   } catch (const rmm::out_of_memory& oom) {
-    // Partially built pieces die with this frame; quiesce first so nothing is freed under an
-    // in-flight kernel. The original input is intact, so the split itself is retried.
+    // The split hook restores every row, including completed pieces, before propagating OOM.
     synchronize_after_exception(stream, pipeline);
     std::optional<std::size_t> retry_requested_bytes;
     if (auto const* cc_oom =
@@ -909,6 +908,7 @@ void gpu_pipeline_task::split_prepared_input(gpu_pipeline_task_local_state& loca
     // split_exhausted off this state when (if) the run OOMs again and stops asking.
     local_state.split_exhausted      = true;
     local_state.pending_split_pieces = 0;
+    if (!pieces.empty()) { local_state._input_data = std::move(pieces.front()); }
     SIRIUS_LOG_INFO(
       "Pipeline {}: task {} could not split the input of operator {} (id={}, index {}) at split "
       "depth {}; running it unsplit",
@@ -932,11 +932,12 @@ void gpu_pipeline_task::split_prepared_input(gpu_pipeline_task_local_state& loca
     pieces.size(),
     requested,
     local_state.split_depth);
+  auto const piece_count = pieces.size();
   throw input_split_exception(std::move(pieces),
                               index,
                               "input of operator " + op.get_name() + " (index " +
                                 std::to_string(index) + ") split into " +
-                                std::to_string(pieces.size()) + " pieces");
+                                std::to_string(piece_count) + " pieces");
 }
 
 std::size_t gpu_pipeline_task::get_input_size() const
@@ -1001,9 +1002,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (ls.pending_split_pieces > 1) {
     // A split task never runs the operators: it hash-partitions the prepared input batch by
-    // batch, keeping every piece until all are built. Peak is the input (pieces) plus cuDF's
-    // per-batch hash and scatter scratch, so 2x the input bounds it; the operator's own
-    // history, which describes the merge that just failed, would only inflate it.
+    // batch and releases each original batch after its pieces are complete. Keep the 2x
+    // input reservation request as a conservative bound for output and per-batch scratch;
+    // the operator's own history describes the merge that just failed and would inflate it.
     info.peak_memory_estimate = memory::saturating_mul(input_basis, 2);
     info.had_history          = false;
     info.reservation_size =

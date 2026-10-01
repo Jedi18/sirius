@@ -276,7 +276,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
 }
 
 std::vector<std::unique_ptr<operator_data>> sirius_physical_operator::split_input(
-  const operator_data& /*input*/,
+  operator_data& /*input*/,
   int /*num_pieces*/,
   uint32_t /*split_round*/,
   ::cuda::stream_ref /*stream*/)

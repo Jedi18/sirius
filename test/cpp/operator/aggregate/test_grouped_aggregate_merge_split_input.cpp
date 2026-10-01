@@ -48,9 +48,11 @@ using Traits = gpu_type_traits<int64_t>;
 /// A merge over GROUP BY col0 with SUM(col1), the shape every HASH_GROUP_BY feeds it.
 std::unique_ptr<sirius_physical_grouped_aggregate_merge> make_sum_merge()
 {
-  auto agg = sirius::test::create_aggregate_expressions<Traits>({0}, {"sum"}, {1});
-  return std::make_unique<sirius_physical_grouped_aggregate_merge>(
+  auto agg   = sirius::test::create_aggregate_expressions<Traits>({0}, {"sum"}, {1});
+  auto merge = std::make_unique<sirius_physical_grouped_aggregate_merge>(
     std::move(agg.output_types), std::move(agg.aggregates), std::move(agg.groups), 0);
+  merge->operator_id = 0;
+  return merge;
 }
 
 /// One partial-aggregate batch: distinct keys `first_key .. first_key + n`, value = key * weight.
@@ -88,7 +90,7 @@ std::size_t rows_of(const operator_data& data)
 TEST_CASE("merge split_input: pieces are key-disjoint and together hold every input row",
           "[physical_grouped_aggregate_merge][oom_split]")
 {
-  auto manager = initialize_memory_manager();
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = default_stream();
@@ -99,7 +101,7 @@ TEST_CASE("merge split_input: pieces are key-disjoint and together hold every in
   std::vector<std::shared_ptr<cucascade::data_batch>> input{make_partial(*space, 0, kKeys, 1),
                                                             make_partial(*space, 0, kKeys, 2),
                                                             make_partial(*space, 500, kKeys, 3)};
-  partitioned_operator_data const partitioned(input, /*partition_idx=*/3);
+  partitioned_operator_data partitioned(input, /*partition_idx=*/3);
 
   auto pieces = merge->split_input(partitioned, 2, /*split_round=*/0, stream);
   stream.sync();
@@ -139,7 +141,7 @@ TEST_CASE("merge split_input: pieces are key-disjoint and together hold every in
 TEST_CASE("merge split_input: merging the pieces separately equals the one-shot merge",
           "[physical_grouped_aggregate_merge][oom_split]")
 {
-  auto manager = initialize_memory_manager();
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = default_stream();
@@ -150,7 +152,7 @@ TEST_CASE("merge split_input: merging the pieces separately equals the one-shot 
                                                             make_partial(*space, 0, kKeys, 5),
                                                             make_partial(*space, 1000, kKeys, 7),
                                                             make_partial(*space, 1500, 10, 11)};
-  pipelineable_operator_data const whole(input);
+  pipelineable_operator_data whole(input);
 
   auto whole_out = merge->execute(whole, stream);
   auto whole_batches =
@@ -194,7 +196,7 @@ TEST_CASE("merge split_input: merging the pieces separately equals the one-shot 
 TEST_CASE("merge split_input: a slot the PARTITION already hashed still splits evenly",
           "[physical_grouped_aggregate_merge][oom_split][hash_partition]")
 {
-  auto manager = initialize_memory_manager();
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = default_stream();
@@ -224,7 +226,7 @@ TEST_CASE("merge split_input: a slot the PARTITION already hashed still splits e
   }
 
   // split_input hashes with its own seed, so the slot divides again.
-  partitioned_operator_data const slot_input({slots[0]}, /*partition_idx=*/0);
+  partitioned_operator_data slot_input({slots[0]}, /*partition_idx=*/0);
   auto pieces = merge->split_input(slot_input, 2, /*split_round=*/0, stream);
   stream.sync();
   REQUIRE(pieces.size() == 2);
@@ -238,7 +240,7 @@ TEST_CASE("merge split_input: a slot the PARTITION already hashed still splits e
 TEST_CASE("merge split_input: a single key cannot be split and says so",
           "[physical_grouped_aggregate_merge][oom_split]")
 {
-  auto manager = initialize_memory_manager();
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = default_stream();
@@ -249,7 +251,7 @@ TEST_CASE("merge split_input: a single key cannot be split and says so",
     std::vector<std::shared_ptr<cucascade::data_batch>> input{make_partial(*space, 42, 1, 1),
                                                               make_partial(*space, 42, 1, 2),
                                                               make_partial(*space, 42, 1, 3)};
-    pipelineable_operator_data const data(input);
+    pipelineable_operator_data data(input);
     auto pieces = merge->split_input(data, 2, 0, stream);
     stream.sync();
     REQUIRE(pieces.size() == 1);
@@ -260,7 +262,7 @@ TEST_CASE("merge split_input: a single key cannot be split and says so",
   SECTION("one row")
   {
     std::vector<std::shared_ptr<cucascade::data_batch>> input{make_partial(*space, 7, 1, 1)};
-    partitioned_operator_data const data(input, 5);
+    partitioned_operator_data data(input, 5);
     auto pieces = merge->split_input(data, 2, 0, stream);
     REQUIRE(pieces.size() == 1);
     auto const* piece = dynamic_cast<const partitioned_operator_data*>(pieces[0].get());
@@ -271,7 +273,7 @@ TEST_CASE("merge split_input: a single key cannot be split and says so",
   SECTION("fewer than two pieces is rejected as a request")
   {
     std::vector<std::shared_ptr<cucascade::data_batch>> input{make_partial(*space, 0, 10, 1)};
-    pipelineable_operator_data const data(input);
+    pipelineable_operator_data data(input);
     CHECK_THROWS_AS(merge->split_input(data, 1, 0, stream), std::invalid_argument);
   }
 }
@@ -279,7 +281,7 @@ TEST_CASE("merge split_input: a single key cannot be split and says so",
 TEST_CASE("merge split_input: empty input batches contribute nothing and are dropped",
           "[physical_grouped_aggregate_merge][oom_split]")
 {
-  auto manager = initialize_memory_manager();
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = default_stream();
@@ -287,7 +289,7 @@ TEST_CASE("merge split_input: empty input batches contribute nothing and are dro
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input{
     make_partial(*space, 0, 0, 1), make_partial(*space, 0, 600, 1), make_partial(*space, 0, 0, 1)};
-  pipelineable_operator_data const data(input);
+  pipelineable_operator_data data(input);
   auto pieces = merge->split_input(data, 2, 0, stream);
   stream.sync();
   REQUIRE(pieces.size() == 2);

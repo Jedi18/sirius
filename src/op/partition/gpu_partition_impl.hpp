@@ -84,8 +84,18 @@ class gpu_partition_impl {
     int num_partitions,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {},
-    uint32_t seed                                         = cudf::DEFAULT_HASH_SEED);
+    const telemetry::batch_telemetry_info& telemetry_info,
+    uint32_t seed);
+
+  /// Existing call path, using cuDF's default seed.
+  static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
+    const cucascade::read_only_data_batch& input,
+    const std::vector<int>& partition_key_idx,
+    const std::vector<cudf::data_type>& partition_key_cast_types,
+    int num_partitions,
+    ::cuda::stream_ref stream,
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(

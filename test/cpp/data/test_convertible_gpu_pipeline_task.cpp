@@ -23,7 +23,9 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
+#include <data/data_batch_utils.hpp>
 #include <exec/multi_index_priority_queue.hpp>
+#include <op/partition/gpu_partition_impl.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
@@ -292,6 +294,62 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   REQUIRE(result.has_value());
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("fresh hash partition output spills while queued and upgrades for processing",
+          "[convertible_gpu_pipeline_task][oom_split]")
+{
+  auto& e    = env();
+  auto input = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, cudf::type_id::INT32);
+  std::shared_ptr<cucascade::data_batch> piece;
+  {
+    auto ro = input->to_read_only();
+    auto parts =
+      sirius::op::gpu_partition_impl::hash_partition(ro, {0}, 2, e.stream(), *e.gpu_space);
+    e.stream().sync();
+    REQUIRE(parts.size() == 2);
+    piece = std::move(parts[0]);
+  }
+  std::size_t original_rows;
+  std::vector<int32_t> original_values;
+  {
+    auto ro = piece->to_read_only();
+    REQUIRE(ro.get_writer_event() != nullptr);
+    auto view       = sirius::get_cudf_table_view(ro);
+    original_rows   = static_cast<std::size_t>(view.num_rows());
+    original_values = sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0));
+    REQUIRE(original_rows > 0);
+  }
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {piece})));
+  {
+    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    auto queued = provider.get_next_convertible(e.gpu_space, false);
+    REQUIRE(queued != nullptr);
+    auto converted = queued->convert({e.host_space}, e.stream(), *e.mgr, true);
+    REQUIRE(converted.has_value());
+  }
+  REQUIRE(get_batch_tier(*piece) == cucascade::memory::Tier::HOST);
+  auto popped = queue.try_pop();
+  REQUIRE(popped.has_value());
+  auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(popped->get());
+  REQUIRE(gpu_task != nullptr);
+  auto* state =
+    dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(gpu_task->local_state());
+  REQUIRE(state != nullptr);
+  auto* data = dynamic_cast<sirius::op::pipelineable_operator_data*>(state->_input_data.get());
+  REQUIRE(data != nullptr);
+  data->prepare_for_processing(e.gpu_space, e.stream());
+  auto read_only = data->get_read_only_batches();
+  REQUIRE(read_only.size() == 1);
+  e.stream().sync();
+  CHECK(read_only[0].get_memory_space() == e.gpu_space);
+  auto view = sirius::get_cudf_table_view(read_only[0]);
+  CHECK(static_cast<std::size_t>(view.num_rows()) == original_rows);
+  CHECK(sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0)) ==
+        original_values);
 }
 
 TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
