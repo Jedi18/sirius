@@ -360,6 +360,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
   r.optional("use_hw_decompression", opt.use_hw_decompression);
+  // 0 is meaningful for both: split on the first OOM / never split.
+  r.optional("oom_split_after_retries", opt.oom_split_after_retries);
+  r.optional("oom_split_max_depth", opt.oom_split_max_depth);
   r.reject_unknown();
 }
 

@@ -466,6 +466,14 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
 
+The only operator that currently implements `supports_input_split()` / `split_input()`: a grouped
+merge is a union over key-disjoint pieces, so when a merge task runs out of memory the GPU executor
+can hash-split its preserved input on the grouping keys and merge the pieces as separate tasks (see
+[pipeline-execution.md](pipeline-execution.md#input-splitting)). The split hashes with
+`gpu_partition_impl::resplit_hash_seed(round)` rather than cuDF's default seed, because the upstream
+PARTITION already placed these rows by `murmur3(keys) % P` and re-hashing with the same seed would
+leave pieces empty whenever the split count shares a factor with `P`.
+
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
 **File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
 

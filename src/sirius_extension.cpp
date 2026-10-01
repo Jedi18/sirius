@@ -2769,6 +2769,24 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
+static void SetOomSplitAfterRetries(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->oom_split_after_retries = UIntegerValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config OOM_SPLIT_AFTER_RETRIES to {}", params->oom_split_after_retries);
+}
+
+static void SetOomSplitMaxDepth(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                   = lock_operator_params_slot(context);
+  params->oom_split_max_depth = UIntegerValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config OOM_SPLIT_MAX_DEPTH to {}", params->oom_split_max_depth);
+}
+
 void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
   auto const& operator_defaults    = defaults.get_operator_params();
@@ -3097,6 +3115,25 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
+
+  // Internal visibility: these tune an engine recovery path and exist so tests can force or
+  // disable input splitting from SQL.
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "oom_split_after_retries",
+                    "plain retries (larger reservation) an out-of-memory task gets before the "
+                    "executor hash-splits its input into smaller tasks; 0 splits on the first OOM",
+                    LogicalType::UINTEGER,
+                    Value::UINTEGER(operator_defaults.oom_split_after_retries),
+                    SetOomSplitAfterRetries);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "oom_split_max_depth",
+                    "how many times one task's input may be hash-split after out-of-memory "
+                    "failures before its pieces fall back to plain retries; 0 disables splitting",
+                    LogicalType::UINTEGER,
+                    Value::UINTEGER(operator_defaults.oom_split_max_depth),
+                    SetOomSplitMaxDepth);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

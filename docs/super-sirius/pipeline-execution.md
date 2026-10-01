@@ -83,7 +83,7 @@ parallel::itask                          // base: local_state + global_state + e
 
 **State classes:**
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
-- `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`
+- `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`, and the input-splitting state (`split_depth`, `ooms_since_split`, `pending_split_pieces`, `split_exhausted`; see [Input splitting](#input-splitting))
 
 **`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each:
 ```cpp
@@ -353,7 +353,7 @@ while running:
     7. stream_pool.acquire_stream()       -- get a CUDA stream
     8. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
          a. task.execute(stream)
-         b. On OOM: retry (see below)
+         b. On OOM: retry, or split the input (see below)
          c. On success: check query completion
          d. Schedule downstream consumers via task_creator
          e. Or: completion_handler.mark_completed()
@@ -435,6 +435,65 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 8. Reschedules the new task back through the manager loop
 
 If max retries are exceeded, the error propagates and terminates the query.
+
+### Input splitting
+
+**Files:** `src/pipeline/oom_split_policy.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`,
+`src/pipeline/gpu_pipeline_task.cpp`, `src/op/sirius_physical_operator.hpp`
+
+Retrying with a larger reservation only helps when the OOM was caused by *other* tasks holding
+memory. When the task's own working set is what does not fit — a `MERGE_GROUP_BY` over one
+partition whose concatenation, hash table and output exceed the GPU — every retry fails the same
+way until the cap trips. For operators that can divide their input, the executor instead splits
+the preserved input into smaller tasks:
+
+```
+task OOMs at operator i
+  │
+  ├─ operators[i].supports_input_split()?  no → plain retry (as above)
+  ├─ fewer than oom_split_after_retries OOMs of this input so far? → plain retry
+  ├─ split_depth >= oom_split_max_depth, or a previous split found one key? → plain retry
+  │
+  └─ otherwise: reschedule ONE task with pending_split_pieces = 2 and no inherited retry floor
+       │  (its reservation is sized at 2x the input: it only hash-partitions, it never merges)
+       └─ gpu_pipeline_task::execute → prepare_for_processing → split_prepared_input:
+            operators[i].split_input(input, 2, split_depth, stream)
+              ├─ 1 piece (single key / single row) → split_exhausted = true, run unsplit
+              └─ 2 pieces → throw input_split_exception(pieces, i)
+                   └─ executor: one new task per piece, resuming at operator i,
+                      split_depth + 1, ooms_since_split = 0, same device pin,
+                      retry_count continued from the lineage; all constructed before the
+                      parent task is destroyed, so the pipeline's task counters never balance early
+```
+
+**Operator contract.** `sirius_physical_operator::supports_input_split()` may return true only
+when `execute()` over an input equals the row-wise union of `execute()` over a key-disjoint
+decomposition of it. `split_input()` must place every input row in exactly one piece, drop
+empty pieces, return fewer than two pieces when the input cannot be divided, and leave the input
+untouched if it throws (so an OOM *during* the split retries the split with the original input).
+`MERGE_GROUP_BY` is the only implementation today: it hash-partitions every input batch on the
+grouping keys with `gpu_partition_impl::resplit_hash_seed(split_round)` — never cuDF's default
+seed, which the plan-level PARTITION used, since re-hashing a `hash % P` slot with the same seed
+leaves pieces empty whenever the new count shares a factor with `P`.
+
+**Correctness.** Groups never straddle pieces, each piece is merged independently, and the
+sink receives each piece's result once; the union is exactly the one-shot result with no
+group lost or duplicated. No output is published for a task that OOMs (the sink is only reached
+by a successful attempt), and the split task itself publishes nothing — it only produces the
+pieces.
+
+**Bounds.** The split depth is capped by `oom_split_max_depth` (default 4, so at most 16 pieces
+per original task); pieces at the cap fall back to plain retries, and every attempt along a
+root-to-leaf chain of retries and splits counts towards the same `MAX_RETRIES`. An input that
+cannot be divided is marked `split_exhausted` and never offered for splitting again. The
+decision itself (`decide_oom_recovery`) is a pure function covered by `[oom_split]` tests; the
+executor path is exercised end to end in `test_oom_split_reschedule.cpp` with a merge that
+reports OOM above a row budget.
+
+**Memory.** The split task holds the input and all pieces at once (about 2x the input, plus
+cuDF's per-batch hash scratch) — far below a merge's concatenation + hash table + output, which
+is why pieces fit where the merge did not. Downgrade still applies: a rescheduled split task's
+input sits unlocked in the executor queue like any other rescheduled input.
 
 ## Error Handling and Draining
 

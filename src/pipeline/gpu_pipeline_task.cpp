@@ -43,6 +43,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -737,6 +738,10 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
   auto input_basis = local_state.get_reservation_size_info()->input_basis;
+  // The executor may have turned this attempt into a split instead of a re-run: the prepared
+  // input is divided here and the pieces go back to the executor as new tasks. Throws unless the
+  // input proved unsplittable, in which case the operators run on it as usual below.
+  if (local_state.pending_split_pieces > 1) { split_prepared_input(local_state, pipeline, stream); }
   std::unique_ptr<op::operator_data> output_data = compute_task(stream);
   std::unique_ptr<op::operator_data> materialized;
 
@@ -839,6 +844,101 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   // Both normal and exceptional exits quiesce the stream before task-owned data is destroyed.
 }
 
+void gpu_pipeline_task::split_prepared_input(gpu_pipeline_task_local_state& local_state,
+                                             sirius_pipeline* pipeline,
+                                             ::cuda::stream_ref stream)
+{
+  auto operators   = pipeline->get_operators();
+  auto const index = local_state._start_operator_index;
+  if (index >= operators.size()) {
+    throw std::runtime_error("gpu_pipeline_task::split_prepared_input: resume index " +
+                             std::to_string(index) + " names no operator (pipeline has " +
+                             std::to_string(operators.size()) + ")");
+  }
+  auto& op             = operators[index].get();
+  auto const requested = local_state.pending_split_pieces;
+  if (!op.supports_input_split()) {
+    throw std::runtime_error("gpu_pipeline_task::split_prepared_input: operator " + op.get_name() +
+                             " cannot split its input");
+  }
+  auto nvtx_label = std::format("Pipeline {}: {} (id={}) split_input x{}",
+                                pipeline->get_pipeline_id(),
+                                op.get_name(),
+                                op.get_operator_id(),
+                                requested);
+  nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
+
+  std::vector<std::unique_ptr<op::operator_data>> pieces;
+  try {
+    pieces = op.split_input(
+      *local_state._input_data, static_cast<int>(requested), local_state.split_depth, stream);
+    // The pieces are handed to other tasks on other streams; their writes must have landed
+    // before anything else may read, free or downgrade them.
+    stream.sync();
+  } catch (const rmm::out_of_memory& oom) {
+    // Partially built pieces die with this frame; quiesce first so nothing is freed under an
+    // in-flight kernel. The original input is intact, so the split itself is retried.
+    synchronize_after_exception(stream, pipeline);
+    std::optional<std::size_t> retry_requested_bytes;
+    if (auto const* cc_oom =
+          dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+      retry_requested_bytes = cc_oom->requested_bytes;
+    }
+    auto const live_allocated_bytes = _allocator ? _allocator->get_allocated_bytes(stream) : 0;
+    local_state.update_retry_reservation_floor_after_oom(
+      local_state.get_reservation_bytes(), live_allocated_bytes, retry_requested_bytes);
+    SIRIUS_LOG_WARN(
+      "Pipeline {}: OOM while splitting the input of operator {} (id={}, index {}) into {} pieces "
+      "for task {}; retrying the split: {}",
+      pipeline->get_pipeline_id(),
+      op.get_name(),
+      op.get_operator_id(),
+      index,
+      requested,
+      get_task_id(),
+      oom.what());
+    // No memory-history record: the split's peak says nothing about the operator's own peak.
+    throw oom_reschedule_exception(std::move(local_state._input_data),
+                                   index,
+                                   "OOM while splitting the input of operator " + op.get_name() +
+                                     " (index " + std::to_string(index) + ")");
+  }
+
+  if (pieces.size() < 2) {
+    // One key or one row: nothing to divide. Run the input as it is; the executor reads
+    // split_exhausted off this state when (if) the run OOMs again and stops asking.
+    local_state.split_exhausted      = true;
+    local_state.pending_split_pieces = 0;
+    SIRIUS_LOG_INFO(
+      "Pipeline {}: task {} could not split the input of operator {} (id={}, index {}) at split "
+      "depth {}; running it unsplit",
+      pipeline->get_pipeline_id(),
+      get_task_id(),
+      op.get_name(),
+      op.get_operator_id(),
+      index,
+      local_state.split_depth);
+    return;
+  }
+
+  SIRIUS_LOG_INFO(
+    "Pipeline {}: task {} split the input of operator {} (id={}, index {}) into {} pieces "
+    "(requested {}) at split depth {}",
+    pipeline->get_pipeline_id(),
+    get_task_id(),
+    op.get_name(),
+    op.get_operator_id(),
+    index,
+    pieces.size(),
+    requested,
+    local_state.split_depth);
+  throw input_split_exception(std::move(pieces),
+                              index,
+                              "input of operator " + op.get_name() + " (index " +
+                                std::to_string(index) + ") split into " +
+                                std::to_string(pieces.size()) + " pieces");
+}
+
 std::size_t gpu_pipeline_task::get_input_size() const
 {
   auto& local_state      = _local_state->cast<gpu_pipeline_task_local_state>();
@@ -898,6 +998,19 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   info.bytes_to_materialize_input = bytes_to_materialize;
   info.retry_reservation_floor    = ls.get_retry_reservation_floor();
   info.had_history                = peak_opt.has_value();
+
+  if (ls.pending_split_pieces > 1) {
+    // A split task never runs the operators: it hash-partitions the prepared input batch by
+    // batch, keeping every piece until all are built. Peak is the input (pieces) plus cuDF's
+    // per-batch hash and scatter scratch, so 2x the input bounds it; the operator's own
+    // history, which describes the merge that just failed, would only inflate it.
+    info.peak_memory_estimate = memory::saturating_mul(input_basis, 2);
+    info.had_history          = false;
+    info.reservation_size =
+      std::max(memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize),
+               info.retry_reservation_floor);
+    return info;
+  }
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;

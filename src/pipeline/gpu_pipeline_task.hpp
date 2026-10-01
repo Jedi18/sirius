@@ -93,6 +93,30 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  /// Input-splitting OOM recovery (see pipeline/oom_split_policy.hpp and
+  /// docs/super-sirius/pipeline-execution.md, "Input splitting"). All four travel with the input
+  /// across reschedules; the executor resets `ooms_since_split` and bumps `split_depth` when it
+  /// fans a task out into pieces.
+  ///
+  /// Splits already applied along this input's lineage (0 = the task creator's original input).
+  uint32_t split_depth = 0;
+  /// OOM reschedules of this exact input since it was created or last split.
+  uint32_t ooms_since_split = 0;
+  /// When > 1, execute() splits the input at _start_operator_index into this many pieces and
+  /// throws input_split_exception instead of running the operators. Set by the executor on the
+  /// rescheduled task it builds after deciding to split.
+  uint32_t pending_split_pieces = 0;
+  /// A split attempt could not divide this input (one key or one row); the executor stops
+  /// asking and falls back to plain retries.
+  bool split_exhausted = false;
+
+  void inherit_split_state(const gpu_pipeline_task_local_state& previous) noexcept
+  {
+    split_depth      = previous.split_depth;
+    ooms_since_split = previous.ooms_since_split;
+    split_exhausted  = previous.split_exhausted;
+  }
+
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
 
@@ -300,6 +324,15 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   {
     return std::dynamic_pointer_cast<sirius_pipeline_task_global_state>(_global_state);
   }
+
+  /// Carry out a split requested by the executor (local_state.pending_split_pieces > 1):
+  /// ask the operator at the resume index for pieces of the prepared input and throw
+  /// input_split_exception with them. Returns normally only when the input proved
+  /// unsplittable, after marking the local state so, in which case the caller runs the
+  /// operators on the original input as usual.
+  void split_prepared_input(gpu_pipeline_task_local_state& local_state,
+                            sirius_pipeline* pipeline,
+                            ::cuda::stream_ref stream);
 
   /**
    * @brief Create a rescheduled task after an OOM event.

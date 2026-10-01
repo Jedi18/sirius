@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::pipeline {
 
@@ -83,6 +84,38 @@ class cuda_launch_reschedule_exception : public task_reschedule_exception {
 
  private:
   int _cuda_error_code;
+};
+
+/**
+ * @brief Replace the failing task by one task per piece of its input.
+ *
+ * Thrown by gpu_pipeline_task::execute when the executor asked it to split its input (see
+ * gpu_pipeline_task_local_state::pending_split_pieces) and the operator at the resume index
+ * produced at least two pieces. Deliberately not a task_reschedule_exception: a plain reschedule
+ * re-runs ONE task with the carried data, while this must fan out into several, and the executor
+ * handles the two cases in different catch blocks.
+ */
+class input_split_exception : public std::exception {
+ public:
+  input_split_exception(std::vector<std::unique_ptr<op::operator_data>> pieces,
+                        size_t resume_operator_index,
+                        std::string message)
+    : _pieces(std::move(pieces)),
+      _resume_operator_index(resume_operator_index),
+      _message(std::move(message))
+  {
+  }
+
+  std::vector<std::unique_ptr<op::operator_data>> release_pieces() { return std::move(_pieces); }
+
+  [[nodiscard]] size_t get_resume_operator_index() const noexcept { return _resume_operator_index; }
+
+  [[nodiscard]] const char* what() const noexcept override { return _message.c_str(); }
+
+ private:
+  std::vector<std::unique_ptr<op::operator_data>> _pieces;
+  size_t _resume_operator_index;
+  std::string _message;
 };
 
 }  // namespace sirius::pipeline

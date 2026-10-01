@@ -676,6 +676,44 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE(value == 0.9);
 }
 
+TEST_CASE("OOM input splitting defaults to one plain retry and four levels, and reads from YAML",
+          "[config_opt][oom_split]")
+{
+  CHECK(operator_params{}.oom_split_after_retries == 1);
+  CHECK(operator_params{}.oom_split_max_depth == 4);
+
+  auto const path = std::filesystem::temp_directory_path() / "sirius_oom_split.yaml";
+  auto write      = [&path](const char* body) {
+    std::ofstream out(path);
+    out << "sirius:\n  operator_params:\n" << body;
+  };
+
+  SECTION("both keys round-trip from YAML")
+  {
+    write(
+      "    oom_split_after_retries: 3\n"
+      "    oom_split_max_depth: 2\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().oom_split_after_retries == 3);
+    CHECK(cfg.get_operator_params().oom_split_max_depth == 2);
+  }
+
+  SECTION("zero is meaningful for both: split on the first OOM, never split")
+  {
+    write(
+      "    oom_split_after_retries: 0\n"
+      "    oom_split_max_depth: 0\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().oom_split_after_retries == 0);
+    CHECK(cfg.get_operator_params().oom_split_max_depth == 0);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML section",
           "[config_opt][dynamic_filter]")
 {

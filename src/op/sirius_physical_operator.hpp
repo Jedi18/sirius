@@ -577,6 +577,38 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
 
+  /**
+   * @brief Whether execute() over an input may be replaced by execute() over disjoint pieces of
+   * that input whose outputs, taken together, equal the original output as a multiset of rows.
+   *
+   * The GPU executor uses this to recover from an out-of-memory failure at this operator: instead
+   * of only retrying the whole input with a larger reservation, it asks @ref split_input for
+   * smaller inputs and runs the rest of the pipeline once per piece. Only an operator whose result
+   * is the row-wise union of its results over a key-disjoint decomposition of the input can say
+   * yes. A grouped-aggregation merge can (rows of different groups never interact); a sort, a
+   * top-N or an ungrouped aggregate cannot.
+   */
+  [[nodiscard]] virtual bool supports_input_split() const noexcept { return false; }
+
+  /**
+   * @brief Split @p input into at most @p num_pieces disjoint inputs for execute().
+   *
+   * Called by the pipeline task only when supports_input_split() is true, on the task's stream
+   * with the task's reservation attached. Every input row lands in exactly one piece. Pieces that
+   * received no rows are omitted, so fewer than @p num_pieces may come back; a result of fewer
+   * than two pieces means the input cannot be split further (a single row or a single key) and
+   * the caller must stop asking. @p split_round counts the splits already applied to this input's
+   * lineage; implementations hash with a round-dependent seed so a later split does not re-derive
+   * an earlier one's boundaries. Must leave @p input untouched when it throws, so an
+   * rmm::out_of_memory raised here can be retried with the original input.
+   *
+   * The base implementation throws; override it together with supports_input_split().
+   */
+  virtual std::vector<std::unique_ptr<operator_data>> split_input(const operator_data& input,
+                                                                  int num_pieces,
+                                                                  uint32_t split_round,
+                                                                  ::cuda::stream_ref stream);
+
   //! The influence the operator has on order (insertion order means no influence)
   virtual sirius::OrderPreservationType operator_order() const
   {

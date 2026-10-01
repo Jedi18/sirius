@@ -111,6 +111,8 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    oom_split_after_retries: 1  # plain OOM retries before the executor hash-splits a task's input
+    oom_split_max_depth: 4      # how many times one input may be split; 0 disables splitting
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -535,6 +537,8 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `oom_split_after_retries` | 1 | When a GPU pipeline task runs out of memory at an operator that can split its input (currently `MERGE_GROUP_BY`), retry it this many times with a larger reservation before hash-splitting the preserved input into two tasks instead. `0` splits on the first OOM. See [pipeline-execution.md](pipeline-execution.md#input-splitting). Registered as an internal SQL option (`SIRIUS_ENABLE_TEST_OPTIONS=1`). |
+| `oom_split_max_depth` | 4 | How many times one task's input may be split along its lineage (so at most 2^depth pieces per original task). Pieces at the cap fall back to plain retries, bounded by the executor's retry cap. `0` disables input splitting. Internal SQL option as above. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 

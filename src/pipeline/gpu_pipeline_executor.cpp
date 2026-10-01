@@ -25,6 +25,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "pipeline/oom_split_policy.hpp"
 #include "pipeline/task_request.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -41,8 +42,60 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+// Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
+// cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
+// against cross-GPU BUILD_PROBE batch-lock contention: the batch
+// was held in `processing` on one GPU while the probe task on the
+// other GPU needed it. Each convert-release cycle is O(100ms) at
+// SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
+// too short. With 100 retries × 50 ms backoff (~5 s) the probe
+// tasks get enough patience to clear the contention window while
+// still bailing out on truly wedged queries.
+//
+// Also bounds input splitting: the pieces of a split inherit the lineage's count, so no
+// root-to-leaf chain of retries and splits exceeds this many attempts.
+constexpr uint32_t MAX_RETRIES = 100;
+
+/// Retry count and original task id for the next attempt of @p gpu_task's lineage.
+std::pair<uint32_t, uint64_t> next_attempt_identity(const gpu_pipeline_task& gpu_task,
+                                                    const gpu_pipeline_task_local_state* cur_local)
+{
+  uint32_t next_retry_count = 1;
+  uint64_t orig_task_id     = gpu_task.get_task_id();
+  if (cur_local && cur_local->original_task_id.has_value()) {
+    next_retry_count = cur_local->retry_count + 1;
+    orig_task_id     = cur_local->original_task_id.value();
+  }
+  return {next_retry_count, orig_task_id};
+}
+
+/// The split knobs of the query this pipeline belongs to; defaults when there is no pipeline
+/// (executor unit tests).
+oom_split_config split_config_for(const sirius_pipeline* pipeline)
+{
+  oom_split_config config;
+  if (pipeline != nullptr) {
+    auto const& params         = pipeline->get_operator_params();
+    config.split_after_retries = params.oom_split_after_retries;
+    config.max_split_depth     = params.oom_split_max_depth;
+  }
+  return config;
+}
+
+bool operator_at_supports_split(const sirius_pipeline* pipeline, size_t index)
+{
+  if (pipeline == nullptr) { return false; }
+  auto operators = pipeline->get_operators();
+  return index < operators.size() && operators[index].get().supports_input_split();
+}
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
@@ -363,6 +416,93 @@ void gpu_pipeline_executor::manager_loop()
         try {
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
+        } catch (input_split_exception& ex) {
+          // The task divided its input instead of running it (see the split decision in the
+          // reschedule handler below). Every piece becomes a task of its own, resuming at the
+          // same operator; together they produce exactly what the one task would have. The
+          // pieces are constructed before `task` dies so the pipeline's created/completed
+          // counters never balance in between.
+          if (completion && completion->has_error()) { return; }
+          auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
+          if (!gpu_task) {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for input split");
+            if (completion) {
+              completion->report_error(
+                "GPU Pipeline Executor: Failed to cast task for input split");
+            }
+            return;
+          }
+          exc_stream->synchronize();
+
+          auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
+          auto const [next_retry_count, orig_task_id] = next_attempt_identity(*gpu_task, cur_local);
+          if (next_retry_count > MAX_RETRIES) {
+            SIRIUS_LOG_ERROR(
+              "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries while "
+              "splitting at operator index {} — terminating query: {}",
+              gpu_task->get_task_id(),
+              orig_task_id,
+              MAX_RETRIES,
+              ex.get_resume_operator_index(),
+              ex.what());
+            if (completion) {
+              completion->report_error(std::make_exception_ptr(std::runtime_error(
+                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
+                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
+            }
+            return;
+          }
+
+          auto pieces              = ex.release_pieces();
+          uint32_t const new_depth = cur_local ? cur_local->split_depth + 1 : 1;
+          SIRIUS_LOG_WARN(
+            "GPU Pipeline Executor: task {} (original task {}) replaced by {} tasks resuming from "
+            "operator index {} at split depth {} (retry {}/{}): {}",
+            gpu_task->get_task_id(),
+            orig_task_id,
+            pieces.size(),
+            ex.get_resume_operator_index(),
+            new_depth,
+            next_retry_count,
+            MAX_RETRIES,
+            ex.what());
+
+          std::vector<std::unique_ptr<gpu_pipeline_task>> children;
+          children.reserve(pieces.size());
+          for (auto& piece : pieces) {
+            auto piece_state = std::make_unique<gpu_pipeline_task_local_state>(
+              std::move(piece), ex.get_resume_operator_index());
+            piece_state->retry_count      = next_retry_count;
+            piece_state->original_task_id = orig_task_id;
+            piece_state->split_depth      = new_depth;
+            // A fresh input: it earns its own plain retries before any further split, and the
+            // parent's retry floor described a run over twice this much data.
+            piece_state->ooms_since_split = 0;
+            piece_state->split_exhausted  = false;
+            // Same device pin as the parent: the pieces live on the GPU that produced them, and
+            // a partitioned consumer's per-partition state is only valid there.
+            if (cur_local && cur_local->get_preferred_device_id().has_value()) {
+              piece_state->set_preferred_device_id(cur_local->get_preferred_device_id().value());
+            }
+            auto const piece_task_id =
+              _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
+            children.push_back(
+              gpu_task->create_rescheduled_task(piece_task_id, std::move(piece_state)));
+          }
+
+          if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+            pipeline_task->telemetry_handle().finalizing({
+              .instance_name = "",
+              .success       = false,
+            });
+            pipeline_task->telemetry_handle().exit();
+            pipeline_task->set_telemetry_finalized();
+          }
+          // Each child goes back through manager_loop() for a reservation sized to its own input.
+          for (auto& child : children) {
+            this->schedule(std::move(child));
+          }
+          return;
         } catch (task_reschedule_exception& ex) {
           // Only THIS query's error state suppresses the reschedule. Previously one query's
           // failure silently stopped every other query's tasks from rescheduling.
@@ -381,23 +521,8 @@ void gpu_pipeline_executor::manager_loop()
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
-          uint32_t next_retry_count = 1;
-          uint64_t orig_task_id     = gpu_task->get_task_id();
-          if (cur_local && cur_local->original_task_id.has_value()) {
-            next_retry_count = cur_local->retry_count + 1;
-            orig_task_id     = cur_local->original_task_id.value();
-          }
+          auto const [next_retry_count, orig_task_id] = next_attempt_identity(*gpu_task, cur_local);
 
-          // Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
-          // cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
-          // against cross-GPU BUILD_PROBE batch-lock contention: the batch
-          // was held in `processing` on one GPU while the probe task on the
-          // other GPU needed it. Each convert-release cycle is O(100ms) at
-          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
-          // too short. With 100 retries × 50 ms backoff (~5 s) the probe
-          // tasks get enough patience to clear the contention window while
-          // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_RETRIES = 100;
           if (next_retry_count > MAX_RETRIES) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
@@ -415,16 +540,6 @@ void gpu_pipeline_executor::manager_loop()
             return;
           }
 
-          SIRIUS_LOG_WARN(
-            "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
-            "resuming from operator index {}: {}",
-            next_retry_count,
-            MAX_RETRIES,
-            gpu_task->get_task_id(),
-            orig_task_id,
-            ex.get_resume_operator_index(),
-            ex.what());
-
           auto intermediate_data = ex.release_intermediate_data();
           if (auto pipelineable_data =
                 dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
@@ -438,7 +553,57 @@ void gpu_pipeline_executor::manager_loop()
             std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
-          if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
+          if (cur_local) { new_local_state->inherit_split_state(*cur_local); }
+
+          // Decide between the plain re-run and an input split. Only an OOM can earn a split;
+          // a CUDA launch failure is transient and says nothing about the input's size. An
+          // attempt that OOM'd while itself splitting keeps its pending split and retries it
+          // with the larger reservation: that OOM was the split's, not the operator's.
+          auto action        = oom_recovery_action::retry;
+          bool const was_oom = dynamic_cast<oom_reschedule_exception*>(&ex) != nullptr;
+          if (cur_local && cur_local->pending_split_pieces > 1) {
+            new_local_state->pending_split_pieces = cur_local->pending_split_pieces;
+          } else if (was_oom) {
+            new_local_state->ooms_since_split += 1;
+            auto const config = split_config_for(pipeline);
+            oom_recovery_state const state{
+              .operator_supports_split =
+                operator_at_supports_split(pipeline, ex.get_resume_operator_index()),
+              .split_exhausted  = new_local_state->split_exhausted,
+              .split_depth      = new_local_state->split_depth,
+              .ooms_since_split = new_local_state->ooms_since_split,
+            };
+            action = decide_oom_recovery(config, state);
+          }
+          if (action == oom_recovery_action::split) {
+            // The split task hash-partitions the input it already holds; the retry floor
+            // describes the operator run that failed and would only over-reserve here.
+            new_local_state->pending_split_pieces = oom_split_config::pieces_per_split;
+            SIRIUS_LOG_WARN(
+              "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}) "
+              "will split the input of operator index {} into {} pieces (split depth {}, {} "
+              "OOMs since last split): {}",
+              next_retry_count,
+              MAX_RETRIES,
+              gpu_task->get_task_id(),
+              orig_task_id,
+              ex.get_resume_operator_index(),
+              oom_split_config::pieces_per_split,
+              new_local_state->split_depth,
+              new_local_state->ooms_since_split,
+              ex.what());
+          } else {
+            if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
+            SIRIUS_LOG_WARN(
+              "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
+              "resuming from operator index {}: {}",
+              next_retry_count,
+              MAX_RETRIES,
+              gpu_task->get_task_id(),
+              orig_task_id,
+              ex.get_resume_operator_index(),
+              ex.what());
+          }
 
           // Preserve the per-task device pin across reschedule. Dropping it lets
           // an OOM'd partition task scatter to the wrong GPU and touch a cuco

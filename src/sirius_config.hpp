@@ -188,6 +188,19 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
+  /// Out-of-memory recovery by input splitting (see docs/super-sirius/pipeline-execution.md,
+  /// "Input splitting"). When a GPU pipeline task runs out of memory at an operator that can
+  /// split its input (today: MERGE_GROUP_BY, by hash of the grouping keys), the executor first
+  /// retries the task this many times with a larger reservation, exactly as before, and then
+  /// hash-splits the preserved input into two halves that run as separate tasks. 0 splits on the
+  /// first OOM.
+  uint32_t oom_split_after_retries = 1;
+
+  /// How many times one task's input may be split along its lineage before the pieces fall back
+  /// to plain retries (bounded by the executor's retry cap). 0 disables input splitting. The
+  /// default allows up to 2^4 = 16 pieces per original task.
+  uint32_t oom_split_max_depth = 4;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

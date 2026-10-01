@@ -275,6 +275,18 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
     std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
+std::vector<std::unique_ptr<operator_data>> sirius_physical_operator::split_input(
+  const operator_data& /*input*/,
+  int /*num_pieces*/,
+  uint32_t /*split_round*/,
+  ::cuda::stream_ref /*stream*/)
+{
+  throw internal_exception(
+    "sirius_physical_operator::split_input: operator '{}' does not support splitting its input "
+    "(supports_input_split() is false)",
+    get_name());
+}
+
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {

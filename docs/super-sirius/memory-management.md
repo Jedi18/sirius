@@ -84,6 +84,11 @@ Wraps RMM device memory resource. On each allocation:
 - If exhausted → fails gracefully, triggering `oom_reschedule_exception`
 - Enables predictable memory usage per task
 
+An `oom_reschedule_exception` is normally answered by re-running the task with a larger
+reservation. When the failing operator can split its input (`MERGE_GROUP_BY`), the executor
+instead hash-splits the preserved input into smaller tasks after a configurable number of plain
+retries; see [pipeline-execution.md](pipeline-execution.md#input-splitting).
+
 ### Caller reservations for HOST conversions
 
 Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.

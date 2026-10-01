@@ -142,6 +142,20 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
+  //! A grouped merge is a union over key-disjoint pieces: rows of different groups never
+  //! interact, so merging each hash-split piece separately yields exactly the merged result.
+  //! Lets the executor recover from an out-of-memory merge by re-running it on smaller inputs.
+  [[nodiscard]] bool supports_input_split() const noexcept override { return true; }
+
+  //! Hash-split every input batch on the grouping keys (the leading `group_idx.size()` columns)
+  //! with gpu_partition_impl::resplit_hash_seed(split_round), so a slot the upstream PARTITION
+  //! already carved out divides evenly again. Zero-row pieces are dropped; the result keeps the
+  //! input's partition index so every piece stays pinned to the GPU holding the data.
+  std::vector<std::unique_ptr<operator_data>> split_input(const operator_data& input,
+                                                          int num_pieces,
+                                                          uint32_t split_round,
+                                                          ::cuda::stream_ref stream) override;
+
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }

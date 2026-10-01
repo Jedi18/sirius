@@ -18,8 +18,10 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
@@ -27,6 +29,10 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
+
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -196,6 +202,93 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   } else {
     return nullptr;
   }
+}
+
+std::vector<std::unique_ptr<operator_data>> sirius_physical_grouped_aggregate_merge::split_input(
+  const operator_data& input_data, int num_pieces, uint32_t split_round, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::split_input"};
+  if (num_pieces < 2) {
+    throw std::invalid_argument("split_input: num_pieces must be at least 2, got " +
+                                std::to_string(num_pieces));
+  }
+  auto const& input             = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto const* partitioned_input = dynamic_cast<const partitioned_operator_data*>(&input_data);
+  // Rebuild each piece with the input's own shape: a partitioned input keeps its slot index so
+  // the task creator / executor pin every piece to the GPU already holding the data.
+  auto wrap = [&](std::vector<std::shared_ptr<cucascade::data_batch>> batches)
+    -> std::unique_ptr<operator_data> {
+    if (partitioned_input != nullptr) {
+      if (auto const idx = partitioned_input->get_partition_idx()) {
+        return std::make_unique<partitioned_operator_data>(std::move(batches), *idx);
+      }
+      return std::make_unique<partitioned_operator_data>(std::move(batches));
+    }
+    return std::make_unique<pipelineable_operator_data>(std::move(batches));
+  };
+
+  // Every merge input leads with its grouping keys (see get_output_grouping_indices). Without
+  // keys every row is one group and nothing can be separated.
+  std::vector<int> const keys = get_output_grouping_indices();
+  auto const ro_batches       = input.get_read_only_batches();
+  std::uint64_t total_rows    = 0;
+  for (auto const& ro : ro_batches) {
+    if (ro.get_data()) {
+      total_rows += static_cast<std::uint64_t>(get_cudf_table_view(ro).num_rows());
+    }
+  }
+  if (keys.empty() || total_rows < 2) {
+    std::vector<std::unique_ptr<operator_data>> single;
+    single.push_back(wrap(input.get_data_batches()));
+    return single;
+  }
+
+  auto const seed = gpu_partition_impl::resplit_hash_seed(split_round);
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> piece_batches(
+    static_cast<std::size_t>(num_pieces));
+  std::vector<std::uint64_t> piece_rows(static_cast<std::size_t>(num_pieces), 0);
+  for (auto const& ro : ro_batches) {
+    if (!ro.get_data() || get_cudf_table_view(ro).num_rows() == 0) { continue; }
+    auto* space = ro.get_memory_space();
+    if (space == nullptr) {
+      throw std::runtime_error("split_input: input batch has no memory space");
+    }
+    auto parts = gpu_partition_impl::hash_partition(ro,
+                                                    keys,
+                                                    /*partition_key_cast_types=*/{},
+                                                    num_pieces,
+                                                    stream,
+                                                    *space,
+                                                    batch_telemetry(),
+                                                    seed);
+    for (std::size_t j = 0; j < parts.size(); ++j) {
+      auto const rows = get_cudf_table_view(*parts[j]).num_rows();
+      // A piece that received nothing from this batch gets no batch at all: the merge expects
+      // at least one row-bearing batch, and an empty one would only cost a lock and a copy.
+      if (rows == 0) { continue; }
+      piece_rows[j] += static_cast<std::uint64_t>(rows);
+      piece_batches[j].push_back(std::move(parts[j]));
+    }
+  }
+
+  std::vector<std::unique_ptr<operator_data>> pieces;
+  std::string rows_log;
+  for (std::size_t j = 0; j < piece_batches.size(); ++j) {
+    if (piece_batches[j].empty()) { continue; }
+    rows_log += (rows_log.empty() ? "" : " ") + std::to_string(piece_rows[j]);
+    pieces.push_back(wrap(std::move(piece_batches[j])));
+  }
+  SIRIUS_LOG_INFO(
+    "merge_group_by id {} split_input: {} batches / {} rows -> {} of {} requested pieces "
+    "(rows per piece: {}) at split round {}",
+    get_operator_id(),
+    ro_batches.size(),
+    total_rows,
+    pieces.size(),
+    num_pieces,
+    rows_log,
+    split_round);
+  return pieces;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
