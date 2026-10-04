@@ -46,9 +46,14 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
+  /// `min_bytes_to_trigger_partitioning` and `min_bytes_per_gpu` are the
+  /// operator_params values; 0 derives them from `hash_partition_bytes` (see
+  /// grouped_merge_partition_strategy).
   sirius_physical_grouped_aggregate_merge(
     sirius_physical_grouped_aggregate* grouped_aggregate,
-    uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
+    uint64_t hash_partition_bytes              = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t min_bytes_to_trigger_partitioning = 0,
+    uint64_t min_bytes_per_gpu                 = 0);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::vector<sirius::logical_type> types,
@@ -147,6 +152,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
   bool _fuse_into_parent = false;
+  //! operator_params.min_bytes_to_trigger_partitioning (0 = 2 x hash_partition_bytes).
+  uint64_t _min_bytes_to_trigger_partitioning = 0;
+  //! operator_params.min_bytes_per_gpu (0 = hash_partition_bytes).
+  uint64_t _min_bytes_per_gpu = 0;
 };
 
 }  // namespace op

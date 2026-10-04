@@ -2434,6 +2434,27 @@ static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
 }
 
+static void SetMinBytesToTriggerPartitioning(ClientContext& context,
+                                             SetScope scope,
+                                             Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                 = lock_operator_params_slot(context);
+  params->min_bytes_to_trigger_partitioning = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MIN_BYTES_TO_TRIGGER_PARTITIONING to {}",
+                   params->min_bytes_to_trigger_partitioning);
+}
+
+static void SetMinBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                 = lock_operator_params_slot(context);
+  params->min_bytes_per_gpu = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MIN_BYTES_PER_GPU to {}", params->min_bytes_per_gpu);
+}
+
 static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2976,6 +2997,22 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
+
+  config.AddExtensionOption(
+    "min_bytes_to_trigger_partitioning",
+    "GROUP BY merge only: inputs below this many bytes merge as one partition on one GPU "
+    "(0 = 2 x hash_partition_bytes)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.min_bytes_to_trigger_partitioning),
+    SetMinBytesToTriggerPartitioning);
+
+  config.AddExtensionOption(
+    "min_bytes_per_gpu",
+    "GROUP BY merge only: input bytes each GPU must get before the merge uses another GPU "
+    "(0 = hash_partition_bytes)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.min_bytes_per_gpu),
+    SetMinBytesPerGpu);
 
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",

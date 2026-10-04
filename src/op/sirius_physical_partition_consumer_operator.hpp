@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -42,6 +44,10 @@ struct partition_sizing_input {
   /// partition has no sibling). A consumer whose task holds both join inputs at once sizes from
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
+  /// Rows waiting on the sizing partition's input port (projected alongside `total_bytes` when
+  /// the bytes are a projection). Best effort: batches whose representation does not record a
+  /// row count are counted at the bytes-per-row of the batches that do.
+  uint64_t total_rows = 0;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is
@@ -112,6 +118,79 @@ struct partition_strategy {
     num_partitions = std::max(num_partitions, min_parts);
   }
   return num_partitions;
+}
+
+/// Most rows one grouped-aggregate merge partition may hold. cuDF columns hold fewer than 2^31
+/// rows and the merge concatenates its partition's input, so the partition count never drops
+/// below `ceil(rows / 2^30)`.
+inline constexpr uint64_t GROUPED_MERGE_MAX_ROWS_PER_PARTITION = uint64_t{1} << 30;
+
+/// `min_bytes_to_trigger_partitioning` with its `0 = derived` default resolved: 2 x
+/// `hash_partition_bytes` (saturating).
+[[nodiscard]] constexpr uint64_t effective_min_bytes_to_trigger_partitioning(
+  uint64_t min_bytes_to_trigger_partitioning, uint64_t hash_partition_bytes)
+{
+  if (min_bytes_to_trigger_partitioning != 0) { return min_bytes_to_trigger_partitioning; }
+  if (hash_partition_bytes > std::numeric_limits<uint64_t>::max() / 2) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return 2 * hash_partition_bytes;
+}
+
+/// `min_bytes_per_gpu` with its `0 = derived` default resolved: `hash_partition_bytes`.
+[[nodiscard]] constexpr uint64_t effective_min_bytes_per_gpu(uint64_t min_bytes_per_gpu,
+                                                             uint64_t hash_partition_bytes)
+{
+  return min_bytes_per_gpu != 0 ? min_bytes_per_gpu : hash_partition_bytes;
+}
+
+/// Partition count and GPU subset for a grouped-aggregate merge exchange.
+///
+/// Below the cliff (`min_bytes_to_trigger_partitioning`, 0 = 2 x H) the merge runs as one
+/// partition on one GPU. At or above it, the exchange uses
+/// `k = clamp(ceil(bytes / min_bytes_per_gpu), 1, n)` GPUs (`min_bytes_per_gpu` 0 = H) and
+/// `max(ceil(bytes / H), k)` partitions round-robin over them. Either way the count is at least
+/// `ceil(rows / GROUPED_MERGE_MAX_ROWS_PER_PARTITION)`. The k GPUs are
+/// `select_gpu_subset(active_gpu_ids, k, operator_id)`, so small merges rotate across GPUs instead
+/// of all landing on the first. An empty `active_gpu_ids` plans for one GPU and leaves the
+/// placement unpinned.
+///
+/// Unlike `natural_num_partitions` (still used by joins) there is no `num_gpus` floor: a small
+/// group-by does not occupy every admitted GPU.
+/// @throws std::invalid_argument if `hash_partition_bytes` is zero.
+[[nodiscard]] inline partition_strategy grouped_merge_partition_strategy(
+  uint64_t total_bytes,
+  uint64_t total_rows,
+  uint64_t hash_partition_bytes,
+  uint64_t min_bytes_to_trigger_partitioning,
+  uint64_t min_bytes_per_gpu,
+  std::vector<int> const& active_gpu_ids,
+  std::size_t operator_id)
+{
+  if (hash_partition_bytes == 0) {
+    throw std::invalid_argument("hash_partition_bytes must be greater than zero");
+  }
+  auto const ceil_div  = [](uint64_t a, uint64_t b) { return a / b + (a % b != 0 ? 1 : 0); };
+  uint64_t const cliff = effective_min_bytes_to_trigger_partitioning(
+    min_bytes_to_trigger_partitioning, hash_partition_bytes);
+  uint64_t const per_gpu = effective_min_bytes_per_gpu(min_bytes_per_gpu, hash_partition_bytes);
+  uint64_t const n       = std::max<uint64_t>(1, active_gpu_ids.size());
+  uint64_t const by_rows = ceil_div(total_rows, GROUPED_MERGE_MAX_ROWS_PER_PARTITION);
+
+  uint64_t k     = 1;
+  uint64_t count = std::max<uint64_t>(1, by_rows);
+  if (total_bytes >= cliff) {
+    k     = std::clamp<uint64_t>(ceil_div(total_bytes, per_gpu), 1, n);
+    count = std::max({ceil_div(total_bytes, hash_partition_bytes), k, by_rows});
+  }
+  count = std::min<uint64_t>(count, std::numeric_limits<int>::max());
+
+  auto const gpus = select_gpu_subset(active_gpu_ids, static_cast<std::size_t>(k), operator_id);
+  return partition_strategy{
+    static_cast<int>(count),
+    /*broadcast=*/false,
+    /*build_probe=*/false,
+    partition_placement::round_robin(static_cast<std::size_t>(count), gpus)};
 }
 
 //! sirius_physical_partition_consumer_operator is an interface for operators

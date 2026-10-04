@@ -66,7 +66,10 @@ void sirius_physical_grouped_aggregate_merge::build_pipelines(
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  sirius_physical_grouped_aggregate* grouped_aggregate, uint64_t hash_partition_bytes)
+  sirius_physical_grouped_aggregate* grouped_aggregate,
+  uint64_t hash_partition_bytes,
+  uint64_t min_bytes_to_trigger_partitioning,
+  uint64_t min_bytes_per_gpu)
   : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,
                                             grouped_aggregate->group_idx,
                                             grouped_aggregate->cudf_aggregates,
@@ -77,8 +80,10 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->has_count_distinct,
                                             grouped_aggregate->estimated_cardinality)
 {
-  child_op              = grouped_aggregate;
-  _hash_partition_bytes = hash_partition_bytes;
+  child_op                           = grouped_aggregate;
+  _hash_partition_bytes              = hash_partition_bytes;
+  _min_bytes_to_trigger_partitioning = min_bytes_to_trigger_partitioning;
+  _min_bytes_per_gpu                 = min_bytes_per_gpu;
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
@@ -153,24 +158,45 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
+  // No num_gpus floor (joins keep natural_num_partitions): a small merge stays on one GPU, and the
+  // GPU count grows with the input. See grouped_merge_partition_strategy.
+  // Unnumbered operators (unit-test fixtures) have no id to rotate by.
+  std::size_t const rotation = has_operator_id() ? operator_id : 0;
+  auto strategy              = grouped_merge_partition_strategy(in.total_bytes,
+                                                   in.total_rows,
+                                                   _hash_partition_bytes,
+                                                   _min_bytes_to_trigger_partitioning,
+                                                   _min_bytes_per_gpu,
+                                                   active_gpu_ids(),
+                                                   rotation);
+  int const num_partitions   = strategy.num_partitions;
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (num_partitions > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(num_partitions) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(num_partitions));
       }
     }
   }
-  return partition_strategy{
-    natural,
-    /*broadcast=*/false,
-    /*build_probe=*/false,
-    partition_placement::round_robin(static_cast<std::size_t>(natural), active_gpu_ids())};
+  SIRIUS_LOG_DEBUG(
+    "merge_group_by id {} sized {} partitions on {} of {} GPUs from {} bytes, {} rows (H {}, "
+    "cliff {}, bytes per GPU {}), placement {}",
+    rotation,
+    num_partitions,
+    std::max<std::size_t>(1, strategy.placement.devices().size()),
+    num_gpus(),
+    in.total_bytes,
+    in.total_rows,
+    _hash_partition_bytes,
+    effective_min_bytes_to_trigger_partitioning(_min_bytes_to_trigger_partitioning,
+                                                _hash_partition_bytes),
+    effective_min_bytes_per_gpu(_min_bytes_per_gpu, _hash_partition_bytes),
+    strategy.placement.to_string());
+  return strategy;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()

@@ -318,6 +318,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (opt.hash_partition_bytes == 0) {
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
   }
+  r.optional("min_bytes_to_trigger_partitioning",
+             yaml::bytes(opt.min_bytes_to_trigger_partitioning));
+  r.optional("min_bytes_per_gpu", yaml::bytes(opt.min_bytes_per_gpu));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));

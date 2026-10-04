@@ -135,6 +135,14 @@ struct operator_params {
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::derived_default_batch_size();
 
+  /// GROUP BY merge only: inputs below this many bytes merge as one partition on one GPU.
+  /// 0 = 2 x hash_partition_bytes, resolved against the merge's own hash_partition_bytes.
+  uint64_t min_bytes_to_trigger_partitioning = 0;
+
+  /// GROUP BY merge only: input bytes each GPU must get before the merge spreads to another GPU
+  /// (k = clamp(ceil(bytes / this), 1, num_gpus)). 0 = hash_partition_bytes.
+  uint64_t min_bytes_per_gpu = 0;
+
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::derived_default_batch_size();
 

@@ -540,7 +540,9 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     // emits LIST sets locally and only becomes BIGINT after merge post-processing.
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
-      op_params.hash_partition_bytes);
+      op_params.hash_partition_bytes,
+      op_params.min_bytes_to_trigger_partitioning,
+      op_params.min_bytes_per_gpu);
     if (hgb_ptr->has_physical_overrides()) {
       merge->set_physical_types(hgb_ptr->get_physical_types());
     }
@@ -840,7 +842,10 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
   partition->children.push_back(std::move(original));
 
   auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-    original_agg_ptr, op_params.hash_partition_bytes);
+    original_agg_ptr,
+    op_params.hash_partition_bytes,
+    op_params.min_bytes_to_trigger_partitioning,
+    op_params.min_bytes_per_gpu);
   // The partition's downstream sizing consumer is the merge (key_source only supplies keys).
   partition_ptr->set_downstream_consumer_op(merge.get());
   merge->children.push_back(std::move(partition));
