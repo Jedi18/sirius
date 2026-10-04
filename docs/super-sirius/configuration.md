@@ -517,6 +517,8 @@ individually.
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
+| `min_bytes_to_trigger_partitioning` | 0 (= 2 × `hash_partition_bytes`) | GROUP BY merge only: a merge input below this many bytes runs as one partition on one GPU. Joins ignore it. See [MERGE_GROUP_BY](operators.md#sirius_physical_grouped_aggregate_merge--merge_group_by). |
+| `min_bytes_per_gpu` | 0 (= `hash_partition_bytes`) | GROUP BY merge only: input bytes each GPU must receive before the merge uses another one, `k = clamp(ceil(bytes / min_bytes_per_gpu), 1, num_gpus)`. Joins ignore it. |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
@@ -727,6 +729,8 @@ SET enable_compressed_materialization = false;
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
+| `min_bytes_to_trigger_partitioning` | 0 (= 2 × `hash_partition_bytes`) | GROUP BY merge: inputs below this stay on one partition and one GPU |
+| `min_bytes_per_gpu` | 0 (= `hash_partition_bytes`) | GROUP BY merge: input bytes per additional GPU |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |

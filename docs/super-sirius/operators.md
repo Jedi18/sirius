@@ -467,6 +467,31 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
 
+**Partition count and GPUs.** The merge sizes its exchange with `grouped_merge_partition_strategy` (`src/op/sirius_physical_partition_consumer_operator.hpp`), not with the `natural_num_partitions` rule that joins use. With `H = hash_partition_bytes`, `n` admitted GPUs, and the input's bytes and rows as measured (or projected) by PARTITION:
+
+```text
+cliff  = min_bytes_to_trigger_partitioning   (0 = 2 x H, the default)
+B      = min_bytes_per_gpu                   (0 = H, the default)
+P_rows = ceil(rows / 2^30)
+
+bytes <  cliff:  P = max(1, P_rows);  k = 1
+bytes >= cliff:  k = clamp(ceil(bytes / B), 1, n)
+                 P = max(ceil(bytes / H), k, P_rows)
+
+placement = round_robin(P, select_gpu_subset(active_gpu_ids, k, operator_id))
+```
+
+There is no `num_gpus` floor: a small GROUP BY does not occupy every admitted GPU, and the GPU used by a single-partition merge rotates with the operator id, so several small merges in one query or in concurrent queries do not all land on the first GPU. `P_rows` keeps each partition under cuDF's column row limit (`< 2^31`), because the merge concatenates its partition's input. Compared with the old rule (`ceil(bytes / H)`, raised to `n` once the input reaches `n x 16 MiB`), inputs below `2 x H` now take one partition on one GPU, inputs between the cliff and `n x B` use fewer GPUs, and larger inputs are unchanged. Worked examples at `H = 5 GiB` on 4 GPUs:
+
+| Merge input | Before | Now |
+|-------------|--------|-----|
+| 70 MB | 4 partitions over 4 GPUs | 1 partition on 1 GPU |
+| 2.6 GB | 4 over 4 | 1 on 1 |
+| 12 GiB | 4 over 4 | 3 over 3 (`k = 3`) |
+| 40 GiB | 8 over 4 | 8 over 4 |
+
+On one GPU the merge keeps one partition up to `2 x H` (10 GiB at the default) and uses `ceil(bytes / H)` above it. Measurements found no single-query latency gain from fewer partitions or fewer GPUs for GROUP BY; the rule exists to free GPUs for concurrent work and to keep a small merge's footprint on one device. Joins, the dense count join, nested loop joins, and ORDER BY are unchanged.
+
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
 **File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
 
