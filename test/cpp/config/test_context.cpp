@@ -54,6 +54,7 @@
 #include <source_location>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1188,6 +1189,73 @@ TEST_CASE("Sirius configuration treats null memory budget forms as absent", "[si
   sirius::sirius_config config;
   REQUIRE_NOTHROW(config.load_from_file(cfg));
   require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
+}
+
+TEST_CASE("GROUP BY merge partitioning settings round-trip through YAML and SQL",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+
+  SECTION("defaults are 0, meaning derived from hash_partition_bytes")
+  {
+    sirius::operator_params const params;
+    CHECK(params.min_bytes_to_trigger_partitioning == 0);
+    CHECK(params.min_bytes_per_gpu == 0);
+  }
+
+  SECTION("YAML values become DuckDB defaults; SET and SET 0 round-trip")
+  {
+    auto const cfg = config_fixture("setting_defaults.yaml");
+    unsetenv("SIRIUS_DISABLE");
+    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+
+    auto read_settings = [&] {
+      auto result = con.Query(R"(
+        SELECT current_setting('min_bytes_to_trigger_partitioning')::UBIGINT,
+               current_setting('min_bytes_per_gpu')::UBIGINT
+      )");
+      REQUIRE(result != nullptr);
+      REQUIRE_FALSE(result->HasError());
+      return std::pair{result->GetValue(0, 0).GetValue<uint64_t>(),
+                       result->GetValue(1, 0).GetValue<uint64_t>()};
+    };
+    auto const& params = sirius_ctx->get_config().get_operator_params();
+
+    CHECK(read_settings() == std::pair{11 * mib, 12 * mib});
+    CHECK(params.min_bytes_to_trigger_partitioning == 11 * mib);
+    CHECK(params.min_bytes_per_gpu == 12 * mib);
+
+    for (auto const* sql :
+         {"SET min_bytes_to_trigger_partitioning = 1234", "SET min_bytes_per_gpu = 5678"}) {
+      auto set = con.Query(sql);
+      REQUIRE(set != nullptr);
+      REQUIRE_FALSE(set->HasError());
+    }
+    CHECK(read_settings() == std::pair{uint64_t{1234}, uint64_t{5678}});
+    CHECK(params.min_bytes_to_trigger_partitioning == 1234);
+    CHECK(params.min_bytes_per_gpu == 5678);
+
+    // 0 is valid: it restores the derived value.
+    for (auto const* sql :
+         {"SET min_bytes_to_trigger_partitioning = 0", "SET min_bytes_per_gpu = 0"}) {
+      auto set = con.Query(sql);
+      REQUIRE(set != nullptr);
+      REQUIRE_FALSE(set->HasError());
+    }
+    CHECK(read_settings() == std::pair{uint64_t{0}, uint64_t{0}});
+    CHECK(params.min_bytes_to_trigger_partitioning == 0);
+    CHECK(params.min_bytes_per_gpu == 0);
+  }
 }
 
 TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius context",
