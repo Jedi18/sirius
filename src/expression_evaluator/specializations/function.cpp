@@ -99,7 +99,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
   // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
   // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  auto const date_operation = alt.date_operation();
+  auto const skip_ast =
+    alt.return_type().id() == sirius::type_id::DECIMAL || date_operation.has_value();
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
@@ -151,7 +153,42 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     }
     return materialize_as_ast_column(result.release_column());
   }
+
+  // libcudf may return a narrower numeric type than the SQL result (e.g. INT32 for length, INT16
+  // for month where DuckDB declares BIGINT). cuDF AST operators and constant IN-lists require the
+  // declared type.
+  auto result = evaluate_function_kernel(alt);
+  if (result.is_scalar()) { return result; }
+  auto const declared_type = sirius::require_cudf_type(alt.return_type());
+  auto const result_type   = result.get_column_view().type();
+  if (result_type == declared_type || !cudf::is_numeric(result_type) ||
+      !cudf::is_numeric(declared_type)) {
+    return result;
+  }
+  return evaluate_result(cudf::cast(result.get_column_view(), declared_type, _stream, _mr));
+}
+
+evaluate_result expression_evaluator::evaluate_function_kernel(
+  sirius::ast::function_call const& alt)
+{
+  auto const resolved_id = alt.function();
+  auto const& args       = alt.arguments();
   auto const output_type = sirius::require_cudf_type(alt.return_type());
+
+  if (auto const date_operation = alt.date_operation(); date_operation.has_value()) {
+    auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
+      if (!value.is_scalar()) { return value.get_column_view(); }
+      // Retain the one-row column in the evaluation result while its view is broadcast.
+      value = evaluate_result(cudf::make_column_from_scalar(value.get_scalar(), 1, _stream, _mr));
+      return cudf::scalar_column_view{value.get_column_view()};
+    };
+    auto const left_input  = as_transform_input(left);
+    auto const right_input = as_transform_input(right);
+    return evaluate_result(temporal::date_arithmetic_checked(
+      left_input, right_input, *date_operation, _input_table.num_rows(), _stream, _mr));
+  }
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {

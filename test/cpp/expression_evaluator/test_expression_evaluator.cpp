@@ -3206,6 +3206,92 @@ TEMPLATE_TEST_CASE("evaluate string case conversion",
     REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
   }
 }
+
+TEMPLATE_TEST_CASE("function results narrower than their SQL type compose inside an AST predicate",
+                   "[expression_evaluator][ast_operand_type]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto const bigint       = logical_type::make(type_id::BIGINT);
+  auto const varchar      = logical_type::make(type_id::VARCHAR);
+  auto const date         = logical_type::make(type_id::DATE);
+
+  // Columns: TINYINT, VARCHAR, DATE. libcudf returns INT32 for length/strlen and INT16 for month,
+  // while DuckDB declares BIGINT.
+  std::vector<int8_t> const tiny{5, 4, 2, 0};
+  std::vector<std::string> const strings{"apple", "kiwi", "fig", ""};
+  std::vector<int32_t> const days{0, 59, 365, 0};  // 1970-01, 1970-03, 1971-01, NULL
+  auto tiny_column = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT8}, tiny.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(tiny_column->mutable_view().data<int8_t>(),
+                     tiny.data(),
+                     tiny.size() * sizeof(int8_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (auto const& s : strings) {
+    cudf::string_scalar scalar(s, true, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto string_column = cudf::concatenate(row_views, stream, mr);
+  auto date_column   = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                                   days.size(),
+                                                   cudf::mask_state::ALL_VALID,
+                                                   stream,
+                                                   mr);
+  REQUIRE(cudaMemcpy(date_column->mutable_view().head<int32_t>(),
+                     days.data(),
+                     days.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(date_column->mutable_view().null_mask(), 3, 4, false, stream);
+  date_column->set_null_count(1);
+  cudf::table_view input({tiny_column->view(), string_column->view(), date_column->view()});
+
+  auto unary_func = [](sirius::function_id id, std::unique_ptr<ast_node> arg) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(arg));
+    return make_func(id, std::move(args), logical_type::make(type_id::BIGINT));
+  };
+  auto select_first_column = [&](ast_node const& expr) {
+    sirius::expression_evaluator evaluator(
+      expr, mr, stream, sirius::expression_query_policy{strategy}, /*min_ast_size=*/1);
+    return copy_column_to_host<int8_t>(evaluator.select(input)->view().column(0));
+  };
+
+  SECTION("CAST(tinyint AS BIGINT) IS NOT DISTINCT FROM length(varchar)")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::not_distinct_from,
+               make_cast(make_ref_typed(0, logical_type::make(type_id::TINYINT)), bigint, false),
+               unary_func(sirius::function_id::length, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 4, 0});
+  }
+  SECTION("BIGINT constant IS DISTINCT FROM strlen(varchar)")
+  {
+    auto expr = make_cmp(sirius::comparison_type::distinct_from,
+                         make_bigint_const(4),
+                         unary_func(sirius::function_id::strlen, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2, 0});
+  }
+  SECTION("month(date) NOT IN BIGINT constants")
+  {
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_bigint_const(3));
+    values.push_back(make_bigint_const(-380));
+    auto expr = make_in(unary_func(sirius::function_id::month, make_ref_typed(2, date)),
+                        std::move(values),
+                        /*negated=*/true);
+    // NOT IN over NULL is NULL, so the NULL date row is filtered.
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2});
+  }
+}
+
 TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
 {
   auto* space         = get_default_gpu_space();
@@ -3312,4 +3398,167 @@ TEST_CASE("subsecond extraction preserves minimum finite ticks",
                                                     : function == sirius::function_id::microsecond
                                                       ? 5224192
                                                       : 5224));
+}
+
+TEST_CASE("DATE arithmetic restores narrow inputs before checked execution",
+          "[expression_evaluator][compressed_materialization][date_arithmetic]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(
+    exp_strategy_enum::MATERIALIZE, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const signature  = GENERATE(0, 1, 2, 3);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const integer    = logical_type::make(type_id::INTEGER);
+  auto const difference = signature == 3;
+  std::vector<std::unique_ptr<sirius::ast::node>> arguments;
+  arguments.push_back(make_ref_typed(0, signature == 1 ? integer : date));
+  arguments.push_back(make_ref_typed(1, signature == 1 || difference ? date : integer));
+  sirius::ast::node expression{
+    sirius::ast::function_call{signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
+                               std::move(arguments),
+                               difference ? logical_type::make(type_id::BIGINT) : date}};
+  exp_executor executor(expression,
+                        get_resource_ref(*space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy},
+                        1);
+  auto left = make_carrier_column(
+    *space, cudf::data_type{cudf::type_id::INT16}, std::vector<int16_t>{-1, 11016, 32760});
+  auto right = make_carrier_column(
+    *space, cudf::data_type{cudf::type_id::INT16}, std::vector<int16_t>{-2, 5, -32760});
+  auto result = executor.evaluate(cudf::table_view{{left->view(), right->view()}});
+  REQUIRE(executor.restored_reference_cast_count_for_testing() == 2);
+  if (difference) {
+    REQUIRE(result->view().column(0).type() == cudf::data_type{cudf::type_id::INT64});
+    REQUIRE(copy_column_to_host<int64_t>(result->view().column(0)) ==
+            std::vector<int64_t>{1, 11011, 65520});
+  } else {
+    REQUIRE(result->view().column(0).type() == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+    REQUIRE(copy_column_to_host<int32_t>(result->view().column(0)) ==
+            (signature == 2 ? std::vector<int32_t>{1, 11011, 65520}
+                            : std::vector<int32_t>{-3, 11021, 0}));
+  }
+}
+
+TEST_CASE("DATE arithmetic broadcasts native scalar operands to the input row count",
+          "[expression_evaluator][date_arithmetic][date_scalar_broadcast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const rows     = GENERATE(0, 1, 3);
+  // 0: scalar/column, 1: column/scalar, 2: scalar/scalar.
+  auto const shape     = GENERATE(0, 1, 2);
+  auto const signature = GENERATE(0, 1, 2);  // DATE + INTEGER, DATE - INTEGER, DATE - DATE.
+  CAPTURE(strategy, rows, shape, signature);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const difference = signature == 2;
+  auto const right_type = difference ? date : logical_type::make(type_id::INTEGER);
+  auto const max        = std::numeric_limits<int32_t>::max();
+  auto const min        = std::numeric_limits<int32_t>::min();
+  std::vector<int32_t> left_values =
+    difference ? std::vector<int32_t>{min, 0, max - 1} : std::vector<int32_t>{-10, 0, 11016};
+  std::vector<int32_t> right_values =
+    difference ? std::vector<int32_t>{max - 1, -10, min} : std::vector<int32_t>{-2, 1, 100};
+  left_values.resize(rows);
+  right_values.resize(rows);
+  auto left      = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT32}, left_values);
+  auto right     = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT32}, right_values);
+  auto left_view = cudf::bit_cast(left->view(), sirius::require_cudf_type(date));
+  auto right_view = cudf::bit_cast(right->view(), sirius::require_cudf_type(right_type));
+  std::vector<std::unique_ptr<ast_node>> arguments;
+  arguments.push_back(shape == 1 ? make_ref_typed(0, date) : make_date_const(10));
+  arguments.push_back(shape == 0   ? make_ref_typed(1, right_type)
+                      : difference ? make_date_const(3)
+                                   : make_int_const(3));
+  auto expression = make_func(signature == 0 ? sirius::function_id::add : sirius::function_id::sub,
+                              std::move(arguments),
+                              difference ? logical_type::make(type_id::BIGINT) : date);
+  // Native construction prevents constant folding from hiding the scalar/scalar path.
+  auto output =
+    run_native_ast(*space, expression.get(), cudf::table_view{{left_view, right_view}}, strategy);
+  auto result = output->view().column(0);
+  REQUIRE(result.size() == rows);
+  REQUIRE(result.null_count() == 0);
+  std::vector<int64_t> expected;
+  for (int row = 0; row < rows; ++row) {
+    int64_t const lhs = shape == 1 ? left_values[row] : 10;
+    int64_t const rhs = shape == 0 ? right_values[row] : 3;
+    expected.push_back(signature == 0 ? lhs + rhs : lhs - rhs);
+  }
+  if (difference) {
+    REQUIRE(result.type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(copy_column_to_host<int64_t>(result) == expected);
+  } else {
+    REQUIRE(result.type() == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+    CHECK(copy_column_to_host<int32_t>(result) ==
+          std::vector<int32_t>(expected.begin(), expected.end()));
+  }
+}
+
+TEST_CASE("DATE scalar broadcast preserves NULL and infinity semantics",
+          "[expression_evaluator][date_arithmetic][date_scalar_broadcast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const date     = logical_type::make(type_id::DATE);
+  auto const integer  = logical_type::make(type_id::INTEGER);
+  auto const max      = std::numeric_limits<int32_t>::max();
+  auto const min      = std::numeric_limits<int32_t>::min();
+  auto stream         = cudf::get_default_stream();
+  auto input          = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                         3,
+                                         cudf::mask_state::ALL_VALID,
+                                         stream,
+                                         get_resource_ref(*space));
+  std::vector<int32_t> values = {max, min, 1};
+  REQUIRE(cudaMemcpy(input->mutable_view().data<int32_t>(),
+                     values.data(),
+                     values.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(input->mutable_view().null_mask(), 2, 3, false, stream);
+  input->set_null_count(1);
+  auto date_view = cudf::bit_cast(input->view(), sirius::require_cudf_type(date));
+  auto evaluate  = [&](std::unique_ptr<ast_node> lhs,
+                      std::unique_ptr<ast_node> rhs,
+                      sirius::function_id function = sirius::function_id::add) {
+    std::vector<std::unique_ptr<ast_node>> arguments;
+    arguments.push_back(std::move(lhs));
+    arguments.push_back(std::move(rhs));
+    auto expression = make_func(function, std::move(arguments), date);
+    return run_native_ast(
+      *space, expression.get(), cudf::table_view{{date_view, input->view()}}, strategy);
+  };
+  SECTION("NULL DATE suppresses offset overflow and sentinel collisions")
+  {
+    auto const function = GENERATE(sirius::function_id::add, sirius::function_id::sub);
+    auto output         = evaluate(make_null_const(date), make_ref_typed(1, integer), function);
+    CHECK(output->view().column(0).null_count() == 3);
+    output = evaluate(make_null_const(date), make_int_const(max), function);
+    CHECK(output->view().column(0).null_count() == 3);
+  }
+  SECTION("NULL INTEGER propagates for column and scalar dates")
+  {
+    auto output = evaluate(make_ref_typed(0, date), make_null_const(integer));
+    CHECK(output->view().column(0).null_count() == 3);
+    output = evaluate(make_date_const(min), make_null_const(integer));
+    CHECK(output->view().column(0).null_count() == 3);
+  }
+  SECTION("infinity DATE ignores extreme offsets and preserves column NULLs")
+  {
+    auto const positive = GENERATE(true, false);
+    auto const infinity = positive ? max : -max;
+    auto output         = evaluate(make_date_const(infinity), make_ref_typed(1, integer));
+    auto result         = output->view().column(0);
+    CHECK(copy_valids_to_host(result) == std::vector<bool>{true, true, false});
+    auto actual = copy_column_to_host<int32_t>(result);
+    CHECK(actual[0] == infinity);
+    CHECK(actual[1] == infinity);
+    output = evaluate(make_date_const(infinity), make_int_const(min), sirius::function_id::sub);
+    CHECK(output->view().column(0).null_count() == 0);
+    CHECK(copy_column_to_host<int32_t>(output->view().column(0)) ==
+          std::vector<int32_t>(3, infinity));
+  }
 }
