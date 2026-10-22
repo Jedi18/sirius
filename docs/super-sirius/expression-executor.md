@@ -55,7 +55,7 @@ hash table uses the descriptors marked as hash keys. Predicate routing retains t
 distinction between ordinary equality and `IS NOT DISTINCT FROM`.
 
 Both partitioning and hash joining use
-[`restore_prepared_join_key`](../../src/op/join_key_preparation.hpp) to restore
+[`restore_prepared_key`](../../src/op/key_preparation.hpp) to restore
 narrowed carriers to the prepared type before hashing. This shared representation
 is a correctness requirement: equal numeric values in different physical types can
 hash differently, sending matching rows to different partitions. Carrier restoration
@@ -204,7 +204,7 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
 
 ### String concatenation
 
@@ -247,6 +247,18 @@ precision. Both checked conversion and millisecond/microsecond extraction use it
 so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
+
+`DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
+match their already-bound signatures and execute through `date_arithmetic_checked()`.
+The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
+collection; DATE inputs are bitcast to day counts without copying. Scalar operands
+use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
+count passed explicitly so scalar-only and empty inputs retain the input shape.
+Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
+collisions. Date differences widen both day counts before subtraction and return
+BIGINT. These operations materialize under every evaluator strategy; standalone
+cuDF AST translation declines them because it cannot implement the checks.
+The existing reference evaluator restores compressed operands before execution.
 
 ### Rounding
 
