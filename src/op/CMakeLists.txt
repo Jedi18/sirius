@@ -80,6 +80,7 @@ target_sources(
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          aggregate/average.cu
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           scan/equality_delete_mask.cu)
