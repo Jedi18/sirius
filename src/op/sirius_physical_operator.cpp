@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "config.hpp"
 #include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
@@ -26,7 +25,6 @@
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/error.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -355,6 +353,16 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
 void sirius_physical_operator::on_input_batch_pushed(std::string_view /*port_id*/,
                                                      ::cucascade::data_batch& /*batch*/)
 {
+}
+
+void sirius_physical_operator::push_data_batch_partitioned(
+  std::string_view port_id, std::shared_ptr<cucascade::data_batch> batch, std::size_t partition_idx)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
+    p->repo->add_data_batch(std::move(batch), partition_idx);
+  }
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,

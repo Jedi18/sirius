@@ -19,7 +19,6 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -319,6 +318,22 @@ step trace_through(sirius_physical_operator const& node,
       auto const targets = channel->planned_target_columns();
       return std::ranges::binary_search(targets, in_pos) ? step::reads_and_moves(in_pos)
                                                          : step::to(in_pos);
+    }
+
+    case SiriusPhysicalOperatorType::BUILD_FILTER: {
+      // Publication reads only join keys, which the following build partition withholds from
+      // deferral. Payloads keep their positions and can carry rowids through this stage.
+      auto const* partition =
+        dynamic_cast<op::sirius_physical_partition const*>(node.get_parent_op());
+      auto const* concat = partition != nullptr ? partition->get_parent_op() : nullptr;
+      auto const* join   = concat != nullptr && concat->type == SiriusPhysicalOperatorType::CONCAT
+                             ? concat->get_parent_op()
+                             : nullptr;
+      bool const under_build_input = join != nullptr && join->input_port_for(*concat) == "build";
+      if (node.children.size() != 1 || node.children.front().get() != &from || !under_build_input) {
+        return step::reads();
+      }
+      return step::to(in_pos);
     }
 
     case SiriusPhysicalOperatorType::HASH_GROUP_BY:
