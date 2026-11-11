@@ -17,6 +17,7 @@
 #include "op/window/whole_partition.hpp"
 
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/average.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -408,7 +409,6 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   finite_arguments.clear();
 
   // 4. Turn the group results of each argument into its sum and average.
-  auto const f64 = cudf::data_type{cudf::type_id::FLOAT64};
   for (std::size_t i = 0; i < arguments.size(); ++i) {
     auto& arg = arguments[i];
     arg.widened.reset();
@@ -438,10 +438,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
       }
     }
     if (arg.needs_avg) {
-      auto sum   = cudf::cast(arg.sum->view(), f64, stream, mr);
-      auto count = cudf::cast(results[i].results[1]->view(), f64, stream, mr);
-      arg.avg    = cudf::binary_operation(
-        sum->view(), count->view(), cudf::binary_operator::DIV, f64, stream, mr);
+      arg.avg = average_as_double(arg.sum->view(), results[i].results[1]->view(), stream, mr);
     }
   }
   // 5. Collect one column per aggregate in request order, with one value per group.
