@@ -431,7 +431,8 @@ static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
 }
 
 // A correlated IN / ANY / ALL: one null-safe key per correlated column (`mark_types`), then the
-// quantified comparison. Mirrors sirius_physical_hash_join::mark_is_correlated.
+// quantified comparison. Mirrors sirius_physical_hash_join::mark_is_correlated. DuckDB sends `=`
+// or `<>` here; it plans an ordered comparison as a min/max aggregate under a SINGLE join.
 static bool is_correlated_any_mark(duckdb::LogicalComparisonJoin const& op)
 {
   auto const correlated = op.mark_types.size();
