@@ -698,7 +698,10 @@ class sirius_physical_operator {
   [[nodiscard]] virtual std::string_view input_port_for(
     sirius_physical_operator const& producer) const;
 
-  /** @brief Return the input barrier; the default is FULL except for ORDER_BY producers. */
+  /**
+   * @brief Return the input barrier; the default is FULL except for ORDER_BY and SORT_KEY_SAMPLE
+   * producers.
+   */
   [[nodiscard]] virtual MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const;
 
@@ -777,9 +780,9 @@ class sirius_physical_operator {
   //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER,
   //! RIGHT_DELIM_JOIN, or DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those
   //! parents consume a child's output through a repository, so the child terminates its own
-  //! pipeline. Unconditional sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION,
-  //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE and the `delim.join` of a RIGHT_DELIM_JOIN
-  //! override to `false`.
+  //! pipeline. Unconditional sinks (e.g. HGB, SORT_KEY_SAMPLE, MERGE ops, CONCAT, PARTITION,
+  //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE, an ORDER_BY under a SORT_KEY_SAMPLE and
+  //! the `delim.join` of a RIGHT_DELIM_JOIN override to `false`.
   virtual bool is_sink() const
   {
     return _parent_op != nullptr &&
